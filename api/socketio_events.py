@@ -17,6 +17,49 @@ _nlp_engine = get_nlp_engine()
 STREAM_ROOM_PREFIX = "stream_"
 
 
+def build_stream_message_data(stream_id, user_id, message_text):
+    """Analyze, persist, and enrich a stream chat message.
+
+    Shares a single NLP + persistence code path between the SocketIO
+    ``send_message`` handler and the REST ``/api/streams/send_message``
+    endpoint. Returns the row dict with sentiment/intent badges, or
+    ``None`` when the stream or user is invalid.
+    """
+    sentiment = _nlp_engine.analyze_sentiment(message_text)
+    intent = _nlp_engine.detect_intent(message_text)
+
+    with session_scope() as session:
+        stream = session.get(LiveStream, stream_id)
+        user = session.get(User, user_id)
+        if not stream or not user:
+            return None
+
+        chat_msg = ChatMessage(
+            stream_id=stream.id,
+            user_id=user.id,
+            message_text=message_text,
+            sentiment_score=sentiment["sentiment_score"],
+            sentiment_label=SentimentLabel(sentiment["sentiment_label"]),
+            intent_tag=IntentTag(intent),
+        )
+        session.add(chat_msg)
+        session.flush()
+        message_data = chat_msg.to_dict()
+
+    # Sentiment / intent badges are presentation hints; keep them in the payload.
+    sentiment_emoji = "🟢" if sentiment["sentiment_label"] == "POSITIVE" else ("🔴" if sentiment["sentiment_label"] == "NEGATIVE" else "🟡")
+    intent_emoji = {
+        "PRICE_INQUIRY": "💰",
+        "QUALITY_INQUIRY": "🌿",
+        "DELIVERY_INQUIRY": "🚚",
+        "GENERAL_CHAT": "💬",
+    }.get(intent, "💬")
+
+    message_data["sentiment_badge"] = sentiment_emoji
+    message_data["intent_badge"] = intent_emoji
+    return message_data
+
+
 def register_socketio_handlers(socketio) -> None:
     @socketio.on("connect")
     def handle_connect(auth=None):
@@ -72,46 +115,12 @@ def register_socketio_handlers(socketio) -> None:
             emit("error", {"message": "stream_id, user_id, and message_text required"})
             return
 
-        # Process through NLP
-        sentiment = _nlp_engine.analyze_sentiment(message_text)
-        intent = _nlp_engine.detect_intent(message_text)
+        message_data = build_stream_message_data(stream_id, user_id, message_text)
+        if message_data is None:
+            emit("error", {"message": "Invalid stream or user"})
+            return
 
-        # Store in database
-        with session_scope() as session:
-            stream = session.get(LiveStream, stream_id)
-            user = session.get(User, user_id)
-
-            if not stream or not user:
-                emit("error", {"message": "Invalid stream or user"})
-                return
-
-            chat_msg = ChatMessage(
-                stream_id=stream.id,
-                user_id=user.id,
-                message_text=message_text,
-                sentiment_score=sentiment["sentiment_score"],
-                sentiment_label=SentimentLabel(sentiment["sentiment_label"]),
-                intent_tag=IntentTag(intent),
-            )
-            session.add(chat_msg)
-            session.flush()
-            message_data = chat_msg.to_dict()
-
-        # Broadcast to stream room
         room = f"{STREAM_ROOM_PREFIX}{stream_id}"
-
-        # Add sentiment badge
-        sentiment_emoji = "🟢" if sentiment["sentiment_label"] == "POSITIVE" else ("🔴" if sentiment["sentiment_label"] == "NEGATIVE" else "🟡")
-        intent_emoji = {
-            "PRICE_INQUIRY": "💰",
-            "QUALITY_INQUIRY": "🌿",
-            "DELIVERY_INQUIRY": "🚚",
-            "GENERAL_CHAT": "💬"
-        }.get(intent, "💬")
-
-        message_data["sentiment_badge"] = sentiment_emoji
-        message_data["intent_badge"] = intent_emoji
-
         emit("new_message", message_data, to=room)
 
     @socketio.on("get_stream_state")

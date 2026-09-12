@@ -26,6 +26,7 @@ from optimization.engine import (
 )
 from optimization.metrics import demand_score, rating_summary, revenue_by_day, sales_summary
 from optimization.recommendation import build_engine_from_products
+from api.socketio_events import STREAM_ROOM_PREFIX, build_stream_message_data
 
 api_bp = Blueprint("api", __name__)
 
@@ -53,17 +54,19 @@ def _serialize_product(product, include_dynamic_price=True):
     """Serialize product with optional dynamic pricing."""
     data = product.to_dict()
     if include_dynamic_price:
-        # Calculate dynamic price
+        # Calculate dynamic price from live order velocity + review sentiment
         with session_scope() as session:
             reviews = session.query(Review).filter(Review.product_id == product.id).all()
             avg_sentiment = 0.0
             if reviews:
                 avg_sentiment = sum(r.sentiment_score for r in reviews) / len(reviews)
+            orders = session.query(Order).filter(Order.product_id == product.id).all()
+            demand = demand_score(orders)
 
         calc = _pricing_engine.calculate_optimal_price(
             product_id=product.id,
             base_price=product.price,
-            demand_factor=0.5,  # Would be computed from order velocity
+            demand_factor=demand,
             stock_kg=product.stock_kg,
             sentiment_score=avg_sentiment
         )
@@ -149,14 +152,20 @@ def create_product():
                 session.add(seller)
                 session.flush()
         elif seller_obj and seller_obj.get("name"):
-            seller = User(
-                username=seller_obj["name"].strip()[:80],
-                email=seller_obj.get("email") or f"{seller_obj['name'].lower().replace(' ', '_')}@example.com",
-                role=UserRole.SELLER,
-                location=(seller_obj.get("location") or "").strip()[:120],
+            seller = (
+                session.query(User)
+                .filter(User.username == seller_obj["name"].strip()[:80])
+                .first()
             )
-            session.add(seller)
-            session.flush()
+            if seller is None:
+                seller = User(
+                    username=seller_obj["name"].strip()[:80],
+                    email=seller_obj.get("email") or f"{seller_obj['name'].lower().replace(' ', '_')}@example.com",
+                    role=UserRole.SELLER,
+                    location=(seller_obj.get("location") or "").strip()[:120],
+                )
+                session.add(seller)
+                session.flush()
 
         if seller is None or seller.role != UserRole.SELLER:
             return _err("valid seller_id or seller object required", 404)
@@ -244,6 +253,30 @@ def create_order():
         session.add(order)
         session.flush()
         created = order.to_dict()
+
+        # Capture notification recipients while the session is still open.
+        buyer_contact = buyer.email
+        seller_contact = product.seller.email if product.seller else buyer_contact
+        remaining_stock = product.stock_kg
+        product_name = product.name
+
+    # Integration layer: fire-and-forget notifications. Graceful whenever
+    # Twilio is not configured (returns an "unsent" payload, never raises).
+    from services import get_twilio_service
+    _twilio = get_twilio_service()
+    _twilio.send_order_confirmation(
+        to=buyer_contact, product_name=product_name,
+        quantity=quantity_kg, total_price=total_price,
+    )
+    _twilio.notify_seller_sale(
+        to=seller_contact, product_name=product_name,
+        quantity=quantity_kg, total_price=total_price,
+    )
+    if remaining_stock < 50:
+        _twilio.send_sms(
+            to=seller_contact,
+            body=f"Low stock alert: {product_name} is down to {remaining_stock}kg. Consider restocking.",
+        )
 
     return _ok({"order": created, "transaction": created}, 201)
 
@@ -349,6 +382,31 @@ def get_chat_messages(stream_id):
             .all()
         )
         return _ok([m.to_dict() for m in reversed(messages)])
+
+
+@api_bp.post("/api/streams/send_message")
+def send_stream_message():
+    """REST alternative to the SocketIO ``send_message`` event.
+
+    Runs the same NLP pipeline, persists the message, returns it with
+    sentiment/intent badges, and broadcasts it to the live stream room so
+    SocketIO subscribers see it in real time.
+    """
+    payload = _payload()
+    stream_id = payload.get("stream_id")
+    user_id = payload.get("user_id")
+    message_text = (payload.get("message_text") or "").strip()
+
+    if not stream_id or not user_id or not message_text:
+        return _err("stream_id, user_id, and message_text required")
+
+    message_data = build_stream_message_data(stream_id, user_id, message_text)
+    if message_data is None:
+        return _err("invalid stream or user", 404)
+
+    from api.app import socketio as _socketio  # lazy: avoid circular import at module load
+    _socketio.emit("new_message", message_data, to=f"{STREAM_ROOM_PREFIX}{stream_id}")
+    return _ok(message_data, 201)
 
 
 # --- Reviews ---------------------------------------------------------------
@@ -465,16 +523,27 @@ def get_recommendations(user_id):
             product_sentiments=product_sentiments
         )
 
-        # Enrich with product details
+        # Enrich with product details + dynamic pricing (reuses the sentiment
+        # map already computed above instead of re-querying per product).
         product_map = {p["id"]: p for p in product_data}
         results = []
         for rec in recs:
             prod = product_map.get(rec["product_id"])
-            if prod:
-                prod = _serialize_product(type('obj', (object,), prod)())
-                prod["recommendation_score"] = rec["score"]
-                prod["recommendation_reason"] = rec["reason"]
-                results.append(prod)
+            if not prod:
+                continue
+            calc = _pricing_engine.calculate_optimal_price(
+                product_id=rec["product_id"],
+                base_price=prod.get("price", 0.0),
+                demand_factor=0.5,
+                stock_kg=prod.get("stock_kg", 0.0),
+                sentiment_score=product_sentiments.get(rec["product_id"], 0.0),
+            )
+            enriched = dict(prod)  # shallow copy; never mutate the shared map
+            enriched["dynamic_price"] = calc.optimal_price
+            enriched["price_change_pct"] = calc.change_pct
+            enriched["recommendation_score"] = rec["score"]
+            enriched["recommendation_reason"] = rec["reason"]
+            results.append(enriched)
 
         return _ok(results)
 

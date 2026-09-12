@@ -219,6 +219,79 @@ def test_forecast(client):
     assert data["history"] == []  # no transactions yet
 
 
+# --- Fix regressions: recommendations enrichment, seller reuse, chat REST ----
+def test_recommendations_user_endpoint_enriched(client):
+    """The user-based recommendations route must return 200 with usable rows."""
+    product_id = _create_product(
+        client, name="Ripe Bananas", price=1.0, quantity=20.0
+    )
+    second = client.post(
+        "/api/products",
+        json={
+            "name": "Green Bananas", "category": "fruits", "price": 1.1,
+            "quantity": 25.0, "seller": {"name": "Dana Farms"},
+        },
+    )
+    assert second.status_code == 201
+    client.post(
+        "/api/transactions",
+        json={"product_id": product_id, "quantity": 2.0, "buyer_name": "Ishan"},
+    )
+    buyer_id = client.get("/api/transactions").get_json()["data"][0]["buyer_id"]
+
+    response = client.get(f"/api/recommendations/{buyer_id}", query_string={"top_n": 5})
+    assert response.status_code == 200
+    results = response.get_json()["data"]
+    assert isinstance(results, list)
+    if results:
+        assert "recommendation_score" in results[0]
+        assert "dynamic_price" in results[0]
+
+
+def test_product_same_seller_reuses_account(client):
+    """Creating two products with the same seller object must not trigger a 500."""
+    payload = {
+        "name": "Red Onions", "category": "vegetables", "price": 1.5,
+        "quantity": 40.0, "seller": {"name": "Ella Farms"},
+    }
+    first = client.post("/api/products", json=payload)
+    assert first.status_code == 201
+    first_seller = first.get_json()["data"]["seller"]["id"]
+    second = client.post("/api/products", json={**payload, "name": "White Onions"})
+    assert second.status_code == 201
+    second_seller = second.get_json()["data"]["seller"]["id"]
+    assert first_seller == second_seller
+
+
+def test_send_message_endpoint(client):
+    """REST chat endpoint persists via NLP and returns badges."""
+    product_id = _create_product(client, name="Carrots", price=1.2, quantity=30.0)
+    client.post(
+        "/api/transactions",
+        json={"product_id": product_id, "quantity": 1.0, "buyer_name": "Hana"},
+    )
+    buyer_id = client.get("/api/transactions").get_json()["data"][0]["buyer_id"]
+    stream = client.post(
+        "/api/streams", json={"seller_id": 1, "stream_title": "Morning Harvest"}
+    ).get_json()["data"]
+
+    response = client.post(
+        "/api/streams/send_message",
+        json={
+            "stream_id": stream["id"],
+            "user_id": buyer_id,
+            "message_text": "How much per kg?",
+        },
+    )
+    assert response.status_code == 201
+    data = response.get_json()["data"]
+    assert data["intent_tag"] == "PRICE_INQUIRY"
+    assert "sentiment_badge" in data and "intent_badge" in data
+
+    listing = client.get(f"/api/streams/{stream['id']}/messages")
+    assert len(listing.get_json()["data"]) == 1
+
+
 # --- Helpers -----------------------------------------------------------------------
 def _create_product(
     client,
