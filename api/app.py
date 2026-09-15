@@ -6,8 +6,9 @@ from flask_socketio import SocketIO
 
 from api.routes import api_bp
 from api.socketio_events import register_socketio_handlers
+from api.dashboard import dashboard_bp
 from config import Config
-from database.connection import init_db
+from database.db import init_db
 
 socketio = SocketIO(async_mode="threading")
 
@@ -17,7 +18,7 @@ def create_app(test_config: dict | None = None):
     app = Flask(__name__)
     app.config.from_mapping(
         SECRET_KEY=Config.SECRET_KEY,
-        DATABASE_URI=Config.effective_database_uri(),
+        DATABASE_URI=Config.MONGO_URI or "mongomock://localhost",
         SQL_ECHO=Config.SQL_ECHO,
     )
     if test_config:
@@ -27,6 +28,7 @@ def create_app(test_config: dict | None = None):
     socketio.init_app(app, cors_allowed_origins="*")
 
     app.register_blueprint(api_bp)
+    app.register_blueprint(dashboard_bp)
     register_socketio_handlers(socketio)
 
     init_db()

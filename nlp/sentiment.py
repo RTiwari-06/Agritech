@@ -42,7 +42,8 @@ class SentimentAnalyzer:
         try:
             from transformers import pipeline
 
-            self._pipeline = pipeline(
+            pipeline_factory: Any = pipeline
+            self._pipeline = pipeline_factory(
                 "sentiment-analysis", model=_model_name(), device=-1
             )
         except Exception:

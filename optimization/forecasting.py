@@ -88,7 +88,7 @@ class DemandForecaster:
         for txn in transactions:
             created = getattr(txn, "created_at", None)
             if created is None:
-                created = datetime.utcnow()
+                created = datetime.utcnow()  # naive, matches DB
             if isinstance(created, datetime):
                 created = created.date()
             # Order uses quantity_kg

@@ -9,6 +9,7 @@ flask-cors==5.0.1
 # --- Persistence ---
 SQLAlchemy==2.0.36
 pymongo==4.10.1
+mongomock==4.3.0
 
 # --- NLP / Machine learning ---
 spacy==3.8.4
@@ -24,7 +25,6 @@ numpy==1.26.4
 # --- Frontend & visualization ---
 streamlit==1.41.1
 plotly==5.24.1
-streamlit-autorefresh==1.0.1
 
 # --- External integrations ---
 twilio==9.3.3
@@ -32,3 +32,5 @@ twilio==9.3.3
 # --- Configuration & testing ---
 python-dotenv==1.0.1
 pytest==8.3.4
+# === Transitive deps that mongomock requires ===
+pytz==2026.3.post1

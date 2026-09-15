@@ -4,21 +4,18 @@ import pytest
 
 from api.app import create_app
 from config import Config
-from database.connection import dispose_engines
+from database.db import dispose as dispose_engines
 
 
 @pytest.fixture()
 def app():
-    original_uri = Config.DATABASE_URI
-    original_pg = Config.PG_DATABASE_URI
-    Config.DATABASE_URI = "sqlite:///:memory:"
-    Config.PG_DATABASE_URI = ""
-    dispose_engines()
+    # MongoDB backend — reset collections before each test so tests are isolated.
+    from database.db import drop_all, init_db
+    drop_all()
+    init_db()
     application, _ = create_app()
     yield application
     dispose_engines()
-    Config.DATABASE_URI = original_uri
-    Config.PG_DATABASE_URI = original_pg
 
 
 @pytest.fixture()

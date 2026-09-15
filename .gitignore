@@ -1,38 +1,25 @@
-# Python
+# Streamlit secrets (local credentials — not committed)
+frontend/.streamlit/secrets.toml
+.streamlit/secrets.toml
+
+# Streamlit frontend-specific caches
+frontend/.streamlit/cache/
+frontend/.streamlit/frontend*.txt
+
+# New multi-page app structure
+app_pages/__pycache__/
+app_pages/*.pyc
+
+# Python bytecode
 __pycache__/
-*.py[cod]
+**/__pycache__/
+*.pyc
+*.pyo
 *.egg-info/
-.eggs/
-build/
-dist/
-.venv/
-venv/
-env/
 
-# Environment / secrets
+# Local configuration and generated databases
 .env
-
-# Data artifacts (SQLite files etc.)
 data/*.db
-data/*.sqlite
-data/*.sqlite3
 
-# Notebooks / caches
-.ipynb_checkpoints/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-htmlcov/
-.coverage
-
-# IDE / OS
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
-
-# ML model downloads
-models/
-
-# Logs
-*.log
+# Temporary data-loader files
+scripts/__load_agmarknet_tmp.py

@@ -28,10 +28,30 @@ except ImportError:
     VADER_AVAILABLE = False
 
 try:
-    from transformers import pipeline
-    TRANSFORMERS_AVAILABLE = True
+    # Deferred import — importing transformers can pull in torch/CUDA and block
+    # module boot. Keep the flag False until someone actually asks for the pipeline.
+    _transformers_imported = False
+    _pipeline_fn = None
 except ImportError:
-    TRANSFORMERS_AVAILABLE = False
+    _transformers_imported = False
+    _pipeline_fn = None
+
+def _ensure_transformers() -> Any:
+    """Lazy-load the transformers ``pipeline`` import.
+
+    Returns the ``pipeline`` callable, or ``None`` if unavailable.
+    Called on first request, not at module import time.
+    """
+    global _transformers_imported, _pipeline_fn
+    if _transformers_imported:
+        return _pipeline_fn
+    try:
+        from transformers import pipeline as _pipeline
+        _transformers_imported = True
+        _pipeline_fn = _pipeline
+        return _pipeline_fn
+    except ImportError:
+        return None
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -102,8 +122,12 @@ class AgriNLPEngine:
                     subprocess.check_call(
                         [sys.executable, "-m", "spacy", "download", Config.NLP_MODEL]
                     )
-                    self._nlp = spacy.load(Config.NLP_MODEL)
-                    logger.info(f"Downloaded and loaded SpaCy model: {Config.NLP_MODEL}")
+                    try:
+                        self._nlp = spacy.load(Config.NLP_MODEL)
+                        logger.info(f"Downloaded and loaded SpaCy model: {Config.NLP_MODEL}")
+                    except Exception as e:
+                        logger.warning(f"Download succeeded but spacy.load failed: {e}")
+                        self._nlp = None
                 except Exception as e:
                     logger.warning(f"Failed to download SpaCy model: {e}")
                     self._nlp = None
@@ -127,41 +151,53 @@ class AgriNLPEngine:
             logger.warning("VADER not available. Using basic lexicon fallback.")
 
     def _load_transformers(self) -> None:
-        """Load HuggingFace transformer models lazily."""
-        if not TRANSFORMERS_AVAILABLE:
-            logger.warning("Transformers not available. Using fallback models.")
-            return
+        """No-op — transformer loading is lazy in _get_transformer_sentiment()."""
+        pass
 
     def _get_transformer_sentiment(self):
-        """Lazily load transformer sentiment pipeline."""
-        if self._transformer_sentiment is None and TRANSFORMERS_AVAILABLE:
-            try:
-                self._transformer_sentiment = pipeline(
-                    "sentiment-analysis",
-                    model=Config.SENTIMENT_MODEL,
-                    device=-1,
-                    return_all_scores=False
-                )
-                logger.info(f"Loaded transformer sentiment model: {Config.SENTIMENT_MODEL}")
-            except Exception as e:
-                logger.warning(f"Failed to load transformer sentiment: {e}")
-                self._transformer_sentiment = False
-        return self._transformer_sentiment if self._transformer_sentiment is not False else None
+        """Lazily load transformer sentiment pipeline.
+
+        Retries on every call so transient failures don't permanently disable
+        the transformer layer for the process lifetime.
+        """
+        pipeline_fn = _ensure_transformers()
+        if pipeline_fn is not None:
+            if self._transformer_sentiment is None:
+                try:
+                    self._transformer_sentiment = pipeline_fn(
+                        "sentiment-analysis",
+                        model=Config.SENTIMENT_MODEL,
+                        device=-1,
+                        return_all_scores=False,
+                    )
+                    logger.info(f"Loaded transformer sentiment model: {Config.SENTIMENT_MODEL}")
+                except Exception as e:
+                    logger.debug(f"Transformer sentiment unavailable: {e}")
+                    self._transformer_sentiment = None
+            return self._transformer_sentiment
+        return None
 
     def _get_transformer_intent(self):
-        """Lazily load transformer zero-shot classification for intent."""
-        if self._transformer_intent is None and TRANSFORMERS_AVAILABLE:
-            try:
-                self._transformer_intent = pipeline(
-                    "zero-shot-classification",
-                    model=Config.INTENT_MODEL,
-                    device=-1
-                )
-                logger.info(f"Loaded transformer intent model: {Config.INTENT_MODEL}")
-            except Exception as e:
-                logger.warning(f"Failed to load transformer intent: {e}")
-                self._transformer_intent = False
-        return self._transformer_intent if self._transformer_intent is not False else None
+        """Lazily load transformer zero-shot classification for intent.
+
+        Retries on every call so transient failures don't permanently disable
+        the transformer layer for the process lifetime.
+        """
+        pipeline_fn = _ensure_transformers()
+        if pipeline_fn is not None:
+            if self._transformer_intent is None:
+                try:
+                    self._transformer_intent = pipeline_fn(
+                        "zero-shot-classification",
+                        model=Config.INTENT_MODEL,
+                        device=-1,
+                    )
+                    logger.info(f"Loaded transformer intent model: {Config.INTENT_MODEL}")
+                except Exception as e:
+                    logger.debug(f"Transformer intent unavailable: {e}")
+                    self._transformer_intent = None
+            return self._transformer_intent
+        return None
 
     def analyze_sentiment(self, text: str) -> Dict[str, Any]:
         """Analyze sentiment of text.

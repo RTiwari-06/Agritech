@@ -13,6 +13,13 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 
+def _get_attr_or_dict(obj, key: str, default=None):
+    """Get *key* from *obj* whether it's a dict or an object with attributes."""
+    if hasattr(obj, "get"):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 class RecommendationEngine:
     """Fit a corpus of documents once, then query for similar items."""
 
@@ -77,17 +84,28 @@ class RecommendationEngine:
 
     @staticmethod
     def search_text_of(product) -> str:
-        """Extract the searchable text from a Product ORM object."""
-        return product.search_text()
+        """Extract the searchable text from a Product (ORM object or MongoDB dict)."""
+        if hasattr(product, "search_text"):
+            return product.search_text()
+        return " ".join(
+            filter(None, [str(_get_attr_or_dict(product, "name", "")), str(_get_attr_or_dict(product, "description", ""))])
+        )
 
 
 def build_engine_from_products(products: Iterable) -> RecommendationEngine:
-    """Fit a shared engine on a list of Product ORM objects."""
+    """Fit a shared engine on a list of Product objects (ORM or MongoDB dicts)."""
     products = list(products)
-    ids = [p.id for p in products]
+
+    def _product_id(p):
+        # MongoDB docs use ``_id``, ORM objects use ``id``.
+        if hasattr(p, "get"):  # dict-like
+            return p.get("_id") or p.get("id")
+        return getattr(p, "id", None)
+
+    ids = [_product_id(p) for p in products]
     documents = [
         RecommendationEngine.search_text_of(p) if hasattr(p, "search_text") else " ".join(
-            filter(None, [str(getattr(p, "name", "")), str(getattr(p, "description", ""))])
+            filter(None, [str(_get_attr_or_dict(p, "name", "")), str(_get_attr_or_dict(p, "description", ""))])
         )
         for p in products
     ]

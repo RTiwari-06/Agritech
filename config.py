@@ -34,9 +34,13 @@ class Config:
     # Optional override, handy to keep a separate URI for CI/production.
     PG_DATABASE_URI: str = os.getenv("PG_DATABASE_URI", "")
 
-    # Optional MongoDB (telemetry / vector cache).
+    # --- MongoDB (primary data store when MONGO_URI is set) ----------------
+    # When MONGO_URI is empty the framework uses mongomock (no server needed).
     MONGO_URI: str = os.getenv("MONGO_URI", "")
     MONGO_DB: str = os.getenv("MONGO_DB", "agritech")
+
+    # Switch backend: "mongo" (default) or "sql" (legacy SQLAlchemy path)
+    DATABASE_BACKEND: str = os.getenv("DATABASE_BACKEND", "mongo").lower()
 
     # --- NLP -----------------------------------------------------------------
     NLP_MODEL: str = os.getenv("NLP_MODEL", "en_core_web_sm")

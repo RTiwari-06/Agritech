@@ -1,0 +1,23 @@
+[theme]
+primaryColor = "#00B4D8"
+backgroundColor = "#0B1C2C"
+secondaryBackgroundColor = "#1B3A4B"
+textColor = "#E8EDF2"
+font = "sans serif"
+
+[client]
+showSidebarNavigation = true
+
+[server]
+headless = true
+port = 8501
+address = "127.0.0.1"
+runOnSave = true
+enableCORS = false
+enableXsrfProtection = true
+maxUploadSize = 256
+
+[browser]
+gatherUsageStats = false
+serverAddress = "127.0.0.1"
+serverPort = 8501

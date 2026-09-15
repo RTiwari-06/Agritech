@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agritech — Command Center</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌾</text></svg>">
+<link rel="stylesheet" href="/static/dashboard/dashboard.css">
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-icon">🌾</div>
+    <div>
+      <div class="brand-title">Agritech</div>
+      <div class="brand-sub">Command Center</div>
+    </div>
+  </div>
+  <nav class="nav">
+    <button class="nav-item active" data-tab="overview">📊 Overview</button>
+    <button class="nav-item" data-tab="marketplace">🛍️ Marketplace</button>
+    <button class="nav-item" data-tab="streams">📺 Live Streams</button>
+    <button class="nav-item" data-tab="orders">🧾 Orders</button>
+    <button class="nav-item" data-tab="analytics">📈 Analytics</button>
+    <button class="nav-item" data-tab="inventory">📦 Inventory</button>
+  </nav>
+  <div class="sidebar-foot">
+    <div id="health-badge" class="health-badge unknown">Checking…</div>
+    <div id="db-badge" class="db-badge">DB: —</div>
+  </div>
+</aside>
+
+<main class="main">
+  <header class="topbar">
+    <h1 id="page-title">📊 Overview</h1>
+    <div class="topbar-right">
+      <button class="btn ghost" id="refresh-btn" title="Refresh all data">🔄 Refresh</button>
+      <div id="clock" class="clock"></div>
+    </div>
+  </header>
+
+  <!-- ============ OVERVIEW ============ -->
+  <section id="tab-overview" class="tab active">
+    <div class="kpi-grid" id="kpi-grid">
+      <div class="kpi-card"><div class="kpi-label">Total Products</div><div class="kpi-value" id="kpi-products">—</div></div>
+      <div class="kpi-card"><div class="kpi-label">Total Orders</div><div class="kpi-value" id="kpi-orders">—</div></div>
+      <div class="kpi-card"><div class="kpi-label">Total Revenue</div><div class="kpi-value" id="kpi-revenue">—</div></div>
+      <div class="kpi-card"><div class="kpi-label">Live Streams</div><div class="kpi-value" id="kpi-streams">—</div></div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title">🌾 Products by Category</div>
+        <div id="chart-categories" class="chart-v"><span class="muted">Loading…</span></div>
+      </div>
+      <div class="card">
+        <div class="card-title">📺 Recent Orders</div>
+        <div id="recent-orders"><span class="muted">Loading…</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ MARKETPLACE ============ -->
+  <section id="tab-marketplace" class="tab">
+    <div class="toolbar">
+      <input id="mp-search" class="input" type="text" placeholder="Search products…">
+      <select id="mp-category" class="input">
+        <option value="">All Categories</option>
+        <option>Grain</option>
+        <option>Vegetable</option>
+        <option>Fruit</option>
+        <option>Organic</option>
+      </select>
+      <select id="mp-buyer" class="input" title="Buyer ID"></select>
+      <button class="btn" id="mp-apply">Apply</button>
+    </div>
+    <div id="product-grid" class="product-grid"><span class="muted">Loading…</span></div>
+  </section>
+
+  <!-- ============ STREAMS ============ -->
+  <section id="tab-streams" class="tab">
+    <div class="card">
+      <div class="card-title">📺 Live Streams</div>
+      <div id="streams-list"><span class="muted">Loading…</span></div>
+    </div>
+    <div class="card" id="chat-card">
+      <div class="card-title">💬 Live Chat</div>
+      <div id="chat-messages" class="chat-box"><span class="muted">Select a stream to view chat.</span></div>
+      <div class="chat-input-row">
+        <input id="chat-text" class="input" type="text" placeholder="Type a message…" disabled>
+        <button id="chat-send" class="btn primary" disabled>Send</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ ORDERS ============ -->
+  <section id="tab-orders" class="tab">
+    <div class="toolbar">
+      <select id="orders-status" class="input">
+        <option value="">All Statuses</option>
+        <option>pending</option>
+        <option>confirmed</option>
+        <option>shipped</option>
+        <option>delivered</option>
+        <option>cancelled</option>
+      </select>
+      <button class="btn" id="orders-apply">Apply</button>
+    </div>
+    <div class="card">
+      <table class="table">
+        <thead><tr><th>#</th><th>Buyer</th><th>Product</th><th>Qty</th><th>Total</th><th>Status</th><th>Date</th></tr></thead>
+        <tbody id="orders-table"><tr><td colspan="7"><span class="muted">Loading…</span></td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ ANALYTICS ============ -->
+  <section id="tab-analytics" class="tab">
+    <div class="toolbar">
+      <label class="toolbar-label">Seller</label>
+      <select id="an-seller" class="input"></select>
+    </div>
+    <div class="kpi-grid" id="an-kpis"></div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title">🔮 7-Day Demand Forecast</div>
+        <div id="chart-forecast" class="chart-h"><span class="muted">Loading…</span></div>
+      </div>
+      <div class="card">
+        <div class="card-title">😊 Sentiment Distribution</div>
+        <div id="chart-sentiment"><span class="muted">Loading…</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ INVENTORY ============ -->
+  <section id="tab-inventory" class="tab">
+    <div class="toolbar">
+      <label class="toolbar-label">Seller</label>
+      <select id="inv-seller" class="input"></select>
+    </div>
+    <div id="inventory-list"><span class="muted">Loading…</span></div>
+  </section>
+</main>
+
+<div id="toast" class="toast"></div>
+<script src="/static/dashboard/dashboard.js"></script>
+</body>
+</html>

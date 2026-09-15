@@ -121,7 +121,7 @@ def embed_text(text: str) -> np.ndarray:
     so callers always receive a dense numpy vector.
     """
     nlp = _load_spacy()
-    if nlp is not None and nlp.has_vectors:
+    if nlp is not None and nlp.vocab.vectors:
         vector = nlp(clean_text(text)).vector
         if np.linalg.norm(vector) > 0:
             return vector.copy()
