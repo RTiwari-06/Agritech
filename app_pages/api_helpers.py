@@ -98,13 +98,16 @@ def _api_get(
     """Cached GET to the backend.  The cache key is (path, params)."""
 
     @st.cache_data(ttl=ttl, show_spinner=show_spinner)
-    def _inner(url: str) -> Dict[str, Any]:
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+    def _inner(url: str) -> Optional[Dict[str, Any]]:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+            return None
 
     url = f"{_API}{path}"
     if params:
@@ -117,7 +120,7 @@ def _api_post(
     data: Dict[str, Any],
     ttl: int = 0,
     show_spinner: bool = False,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """POST to the backend (no caching — side-effect)."""
     url = f"{_API}{path}"
     body = json.dumps(data).encode("utf-8")
@@ -130,8 +133,11 @@ def _api_post(
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        return None
 
 
 def material_symbol(name: str, fallback: str = "circle") -> str:

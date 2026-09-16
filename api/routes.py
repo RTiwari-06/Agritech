@@ -491,6 +491,24 @@ def list_streams():
         return _ok([stream_to_dict(s) for s in streams])
 
 
+@api_bp.get("/api/streams/<int:stream_id>")
+def get_stream(stream_id):
+    """Fetch a single live stream (used by the seller studio panel)."""
+    with session_scope() as s:
+        stream = s["live_streams"].find_one({"_id": stream_id})
+        if stream is None:
+            return _err("stream not found", 404)
+        result = stream_to_dict(stream)
+        seller = _lookup_seller(s, stream.get("seller_id"))
+        if seller:
+            result["seller"] = {
+                "id": seller["_id"],
+                "username": seller.get("username", ""),
+                "location": seller.get("location", ""),
+            }
+        return _ok(result)
+
+
 @api_bp.post("/api/streams")
 def create_stream():
     payload = _payload()
@@ -1072,6 +1090,50 @@ def get_seller(seller_id):
         if seller is None:
             return _err("seller not found", 404)
         return _ok(user_to_dict(seller))
+
+
+@api_bp.get("/api/seller/<int:seller_id>/orders")
+def get_seller_orders(seller_id):
+    """Orders for a seller's products — powers the seller-studio orders tab."""
+    with session_scope() as s:
+        seller = _lookup_seller(s, seller_id)
+        if seller is None or seller.get("role") != UserRole.SELLER.value:
+            return _err("seller not found or not a seller", 404)
+
+        product_ids = [
+            p["_id"]
+            for p in s["products"].find({"seller_id": seller_id}, {"_id": 1})
+        ]
+        orders = list(
+            s["orders"]
+            .find({"product_id": {"$in": product_ids}})
+            .sort("created_at", -1)
+            .limit(200)
+        )
+
+        result = []
+        for o in orders:
+            buyer = _lookup_user(s, o.get("buyer_id"))
+            prod = _lookup_product(s, o.get("product_id"))
+            entry = order_to_dict(
+                o,
+                buyer_username=buyer.get("username", "") if buyer else "",
+                product_name=prod.get("name", "") if prod else "",
+            )
+            entry["buyer"] = (
+                {
+                    "id": buyer["_id"],
+                    "username": buyer.get("username", ""),
+                    "email": buyer.get("email", ""),
+                    "location": buyer.get("location", ""),
+                }
+                if buyer
+                else {}
+            )
+            entry["ordered_at"] = o.get("created_at", "")
+            result.append(entry)
+
+        return _ok(result)
 
 
 @api_bp.get("/api/seller/<int:seller_id>/inventory")
