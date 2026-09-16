@@ -58,6 +58,8 @@ MATERIAL_SYMBOLS: Dict[str, str] = {
     "chart_line": "show_chart",
     "star": "star",
     "star_outline": "star_outline",
+    "star_half": "star_half",
+    "lock": "lock",
     "warning": "warning",
     "info": "info",
     "cancel": "cancel",
@@ -140,12 +142,6 @@ def _api_post(
         return None
 
 
-def material_symbol(name: str, fallback: str = "circle") -> str:
-    """Return a ``:material/...:`` shorthand — empty when the material name
-    isn't known to us, so the caption still degrades gracefully."""
-    return f":material/{name}:"
-
-
 # ---------------------------------------------------------------------------
 # #6  Native st.badge helpers — no unsafe_allow_html needed
 # ---------------------------------------------------------------------------
@@ -166,20 +162,24 @@ def badge_sentiment(sentiment: str, delta: float = 0.0) -> None:
     st.badge(label=f"{sentiment}  ({delta:+.1%})", icon=f":material/{icon}:", color=color)
 
 
-def badge_status(text: str, color: str = "blue") -> None:
-    st.badge(label=text, icon=":material/info:", color=color)
+def badge_status(text: str, color: str = "blue", icon: str = "info") -> None:
+    st.badge(label=text, icon=f":material/{icon}:", color=color)
 
 
-def badge_trend(direction: str) -> None:
-    color = "green" if direction > 0 else ("red" if direction < 0 else "grey")
-    icon = "trending_up" if direction > 0 else ("trending_down" if direction < 0 else "direction")
-    st.badge(label=f"{'+' if direction > 0 else ''}{direction:.1f}%", icon=f":material/{icon}:", color=color)
+def badge_trend(direction: float, suffix: str = "%") -> None:
+    delta = float(direction)
+    color = "green" if delta > 0 else ("red" if delta < 0 else "gray")
+    icon = "trending_up" if delta > 0 else ("trending_down" if delta < 0 else "trending_flat")
+    st.badge(
+        label=f"{'+' if delta > 0 else ''}{delta:.1f}{suffix}",
+        icon=f":material/{icon}:",
+        color=color,
+    )
 
 
 def badge_rating(rating: float) -> None:
-    stars = round(rating)
-    icon = f"star" if stars > 0 else "star_outline"
-    color = "gold" if rating >= 4 else ("orange" if rating >= 3 else "grey")
+    icon = "star" if rating > 0 else "star_outline"
+    color = "green" if rating >= 4.0 else ("orange" if rating >= 3.0 else "gray")
     st.badge(label=f"{rating:.1f} / 5.0", icon=f":material/{icon}:", color=color)
 
 
@@ -242,13 +242,14 @@ def product_card_row(product: Dict[str, Any], index: int) -> None:
     price = product.get("price") or 0.0
     stock = product.get("stock_kg") or 0.0
     rating = product.get("rating") or 0.0
+    live_engagement = product.get("live_engagement")
+    live_boost = product.get("live_price_boost_pct") or 0.0
     seller_name = product.get("seller", {}).get("username") or "Seller"
     location = product.get("seller", {}).get("location") or "—"
-    stock_status = _stock_status(stock)
-    rating_stars = _stars(rating)
+    status_key, status_icon, status_color = _stock_status(stock)
 
     col_img, col_meta, col_price, col_stock, col_action = st.columns(
-        [2, 2, 1.2, 1.2, 1.4],
+        [1.2, 2.2, 1.2, 1.2, 1.4],
         vertical_alignment="center",
     )
 
@@ -260,23 +261,28 @@ def product_card_row(product: Dict[str, Any], index: int) -> None:
 
     with col_meta:
         st.markdown(f"**{name}**", help=f"Category: {category}")
-        st.caption(f"{material_symbol('person')} {seller_name} · "
-                   f"{material_symbol('place')} {location} · "
-                   f"{material_symbol('tag')} {category}")
-        st.caption(material_symbol("star") + f"  {rating_stars}")
+        st.caption(
+            f"{material_symbol('person')} {seller_name} · "
+            f"{material_symbol('place')} {location} · "
+            f"{material_symbol('tag')} {category}"
+        )
+        st.markdown(f"{material_symbol('star')}  {_stars(rating)}")
 
     with col_price:
         st.markdown(f"**₹{price:.2f} / kg**")
         badge_trend(product.get("price_change_pct") or 0)
+        if live_engagement is not None:
+            st.caption(f"{material_symbol('live_tv')}  Boost {live_boost:+.1f}%")
 
     with col_stock:
         st.markdown(f"~{stock:.0f} kg")
-        badge_status(stock_status, color="green" if stock_status.startswith("✓") else "red")
+        badge_status(status_key, color=status_color, icon=status_icon)
 
     with col_action:
         buyer_id = st.session_state.get("buyer_id")
         if buyer_id:
             api_url = f"/api/orders"
+
             def _place_order():
                 item = product
                 _api_post(
@@ -290,64 +296,44 @@ def product_card_row(product: Dict[str, Any], index: int) -> None:
                 )
                 st.rerun()
 
-            btn = st.button(
+            st.button(
                 f"{material_symbol('shopping_cart')}  Buy 1 kg",
                 key=f"buy_{product['id']}_{index}",
-                use_container_width=True,
+                width="stretch",
                 on_click=_place_order,
             )
         else:
             st.button(
-                "Login to buy",
+                f"{material_symbol('lock')}  Login to buy",
                 key=f"login_{product['id']}_{index}",
-                use_container_width=True,
+                width="stretch",
                 type="secondary",
                 disabled=True,
             )
 
 
-def _stock_status(stock_kg: float) -> str:
+def _stock_status(stock_kg: float) -> tuple[str, str, str]:
     if stock_kg <= 0:
-        return "✗  Out of stock"
+        return "Out of stock", "cancel", "red"
     if stock_kg < 50:
-        return "⚠  Low stock"
+        return "Low stock", "warning", "orange"
     if stock_kg < 200:
-        return "●  Limited"
-    return "✓  In stock"
+        return "Limited", "inventory_2", "yellow"
+    return "In stock", "check_circle", "green"
 
 
 def _stars(rating: float) -> str:
     full = int(rating)
     half = 1 if (rating - full) >= 0.5 else 0
-    empty = 5 - full - half
-    return ("★" * full) + ("½" * half) + ("☆" * empty)
+    empty = max(5 - full - half, 0)
+    return (":material/star: " * full) + (":material/star_half: " * half) + (":material/star_outline: " * empty)
 
 
 def skeleton_card(label: str = "Loading…") -> None:
-    """Placeholder skeleton card for pages that load data asynchronously (#4)."""
-    col1, col2 = st.columns([3, 2])
-    with col1:
-        st.markdown(
-            "<div style='background:#e5e7eb; height:48px; width:48px; "
-            "border-radius:50%; margin-bottom: 8px;'></div>"
-            "<div style='background:#e5e7eb; height:14px; width:60%; "
-            "border-radius:4px; margin-bottom:4px;'></div>"
-            "<div style='background:#e5e7eb; height:10px; width:40%; "
-            "border-radius:4px;'></div>",
-            unsafe_allow_html=True,
-        )
-    with col2:
-        for _ in range(2):
-            st.markdown(
-                "<div style='background:#e5e7eb; height:14px; width:100%; "
-                "border-radius:4px; margin-bottom:4px;'></div>",
-                unsafe_allow_html=True,
-            )
-        st.markdown(
-            "<div style='background:#e5e7eb; height:40px; width:100%; "
-            "border-radius:6px;'></div>",
-            unsafe_allow_html=True,
-        )
+    """Native loading skeleton placeholder (#4)."""
+    with st.skeleton(height=64):
+        st.caption(label)
+        st.text("")
 
 
 def chart_bar(
@@ -377,7 +363,7 @@ def chart_bar(
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#E8EDF2"),
     )
-    st.plotly_chart(fig, use_container_width=True, theme="streamlit-dark")
+    st.plotly_chart(fig, theme=None)
 
 
 def chart_line(
@@ -406,7 +392,7 @@ def chart_line(
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#E8EDF2"),
     )
-    st.plotly_chart(fig, use_container_width=True, theme="streamlit-dark")
+    st.plotly_chart(fig, theme=None)
 
 
 def chart_sentiment_pie(sentiments: Dict[str, int]) -> None:
@@ -425,7 +411,7 @@ def chart_sentiment_pie(sentiments: Dict[str, int]) -> None:
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#E8EDF2"),
     )
-    st.plotly_chart(fig, use_container_width=True, theme="streamlit-dark")
+    st.plotly_chart(fig, theme=None)
 
 
 def _current_user_id() -> Optional[int]:

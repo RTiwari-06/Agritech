@@ -18,7 +18,8 @@ class PriceSuggestion:
     demand_factor: float
     stock_factor: float
     competitor_adjustment: float
-    reason: str
+    live_adjustment: float = 0.0
+    reason: str = ""
 
 
 class DynamicPricingEngine:
@@ -50,6 +51,7 @@ class DynamicPricingEngine:
         competitor_min: Optional[float] = None,
         competitor_max: Optional[float] = None,
         reference_price: Optional[float] = None,
+        live_engagement: Optional[float] = None,
     ) -> PriceSuggestion:
         base = max(float(base_price or 0.0), 0.0)
         if base <= 0:
@@ -75,6 +77,11 @@ class DynamicPricingEngine:
         suggested = base * demand_factor * stock_factor
         suggested = suggested * (1.0 + self.margin if reference_price is not None else 1.0)
 
+        live_adjustment = 0.0
+        if live_engagement is not None:
+            live_adjustment = (max(0.0, min(1.0, float(live_engagement))) - 0.5) * 0.1
+            suggested *= 1.0 + live_adjustment
+
         competitor_adjustment = 0.0
         reason = "baseline recommendation"
         if competitor_min is not None and competitor_max is not None:
@@ -97,5 +104,6 @@ class DynamicPricingEngine:
             demand_factor=round(demand_factor, 4),
             stock_factor=round(stock_factor, 4),
             competitor_adjustment=round(competitor_adjustment, 4),
+            live_adjustment=round(live_adjustment, 4),
             reason=reason,
         )

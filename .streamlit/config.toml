@@ -1,23 +1,73 @@
+# Agritech Marketplace — custom theme (dark, agricultural green)
+
 [theme]
-primaryColor = "#00B4D8"
-backgroundColor = "#0B1C2C"
-secondaryBackgroundColor = "#1B3A4B"
-textColor = "#E8EDF2"
-font = "sans serif"
+base = "dark"
+primaryColor = "#4CB944"          # fresh produce green
+backgroundColor = "#0D1B14"       # deep green-black
+secondaryBackgroundColor = "#15281D"
+codeBackgroundColor = "#15281D"
+textColor = "#E8F1EC"
+linkColor = "#7ED957"
+borderColor = "#2B4235"
+codeTextColor = "#C5D7CC"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "8px"
+buttonRadius = "8px"
 
-[client]
-showSidebarNavigation = true
+# Typography — clean, readable sans-serif
+font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseFontSize = 14
+baseFontWeight = 400
+headingFontSizes = ["28px", "22px", "18px", "16px", "14px", "12px"]
+headingFontWeights = [700, 600, 600, 600, 500, 500]
+linkUnderline = false
 
-[server]
-headless = true
-port = 8501
-address = "127.0.0.1"
-runOnSave = true
-enableCORS = false
-enableXsrfProtection = true
-maxUploadSize = 256
+# Semantic colors
+greenColor = "#34D399"
+redColor = "#F87171"
+yellowColor = "#FBBF24"
+orangeColor = "#FB923C"
+blueColor = "#5EB0EF"
+violetColor = "#A78BFA"
+grayColor = "#94A3B8"
 
-[browser]
-gatherUsageStats = false
-serverAddress = "127.0.0.1"
-serverPort = 8501
+# Chart colors — distinguishable categorical palette
+chartCategoricalColors = [
+    "#4CB944",
+    "#34D399",
+    "#5EB0EF",
+    "#FBBF24",
+    "#F87171",
+    "#A78BFA",
+    "#FB923C",
+    "#94A3B8",
+]
+
+# Sequential colors for heatmaps/gradients (green ramp)
+chartSequentialColors = [
+    "#082F1C",
+    "#0B4726",
+    "#0F5F31",
+    "#147C3B",
+    "#1B9E46",
+    "#34D399",
+    "#6EE7B7",
+    "#A7F3D0",
+    "#D1FAE5",
+]
+
+# Dataframe styling
+dataframeBorderColor = "#2B4235"
+dataframeHeaderBackgroundColor = "#15281D"
+
+# Sidebar
+[theme.sidebar]
+backgroundColor = "#0D1B14"
+secondaryBackgroundColor = "#15281D"
+codeBackgroundColor = "#15281D"
+textColor = "#E8F1EC"
+borderColor = "#2B4235"
+primaryColor = "#4CB944"

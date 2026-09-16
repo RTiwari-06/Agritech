@@ -32,12 +32,20 @@ from database.models import (
     price_log_to_dict,
 )
 from nlp.nlp_engine import get_nlp_engine
+from nlp.processing import semantic_scores
 from optimization.engine import (
     DynamicPricingEngine,
     RecommendationEngine,
     DemandForecaster,
 )
-from optimization.metrics import demand_score, rating_summary, revenue_by_day, sales_summary
+from optimization.metrics import (
+    demand_score,
+    rating_summary,
+    revenue_by_day,
+    restock_advice,
+    sales_summary,
+    stream_engagement_score,
+)
 from optimization.recommendation import build_engine_from_products
 from api.socketio_events import STREAM_ROOM_PREFIX, build_stream_message_data
 
@@ -49,19 +57,51 @@ _recommendation_engine = RecommendationEngine()
 _forecaster = DemandForecaster()
 
 
+def _json_safe(value):
+    """Recursively coerce values to JSON-serializable primitives.
+
+    Legacy rows created before the integer ``_id`` convention can carry a
+    bson ``ObjectId``; without coercion Flask's JSON encoder raises
+    ``TypeError: Object of type ObjectId is not JSON serializable``.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    try:
+        _is_object_id = isinstance(value, pymongo.ObjectId)
+    except AttributeError:
+        _is_object_id = type(value).__name__ == "ObjectId"
+    if _is_object_id:
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
+    from datetime import date, datetime
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
 def _ok(data, status=200):
-    return {"ok": True, "data": data}, status
+    return {"ok": True, "data": _json_safe(data)}, status
 
 
 def _err(message, status=400):
-    return {"ok": False, "error": message}, status
+    return {"ok": False, "error": _json_safe(message)}, status
 
 
 def _payload():
     return request.get_json(silent=True) or {}
 
 
-def _serialize_product(session, product, include_dynamic_price=True):
+def _serialize_product(session, product, include_dynamic_price=True, live_engagement=None):
     """Serialize a product document with optional dynamic pricing."""
     data = product_to_dict(product)
     if include_dynamic_price:
@@ -81,9 +121,14 @@ def _serialize_product(session, product, include_dynamic_price=True):
             demand_factor=demand,
             stock_kg=product.get("stock_kg", 0.0),
             sentiment_score=avg_sentiment,
+            live_engagement=live_engagement,
         )
         data["dynamic_price"] = calc.optimal_price
         data["price_change_pct"] = calc.change_pct
+        data["live_engagement"] = (
+            round(live_engagement, 4) if live_engagement is not None else None
+        )
+        data["live_price_boost_pct"] = round(calc.live_factor * 100, 2)
     return data
 
 
@@ -98,6 +143,59 @@ def _lookup_product(session, product_id: int):
 
 def _lookup_user(session, user_id: int):
     return session["users"].find_one({"_id": user_id})
+
+
+def _seller_live_engagement(session, seller_id: int) -> float | None:
+    """Chat-driven purchase-intent signal in [0, 1] from the seller's live streams.
+
+    Returns ``None`` when there is no active stream (or no chat yet) so the
+    pricing engine stays neutral instead of penalising a seller for silence.
+    """
+    streams = list(
+        session["live_streams"].find({"seller_id": seller_id, "is_active": True})
+    )
+    if not streams:
+        return None
+    stream_ids = [s["_id"] for s in streams]
+    messages = list(session["chat_messages"].find({"stream_id": {"$in": stream_ids}}))
+    if not messages:
+        return None
+    return stream_engagement_score(messages)
+
+
+def _restock_recommendations(
+    session,
+    seller_id: int,
+    horizon: int = 7,
+    target_days: float = 7.0,
+    safety_stock: float = 20.0,
+) -> list[dict]:
+    """Forecast-driven reorder advice for every product a seller owns."""
+    products = list(session["products"].find({"seller_id": seller_id}))
+    recommendations = []
+    for product in products:
+        orders = list(session["orders"].find({"product_id": product["_id"]}))
+        historical = [
+            {"date": o.get("created_at", "")[:10], "quantity": o.get("quantity_kg", 0)}
+            for o in orders
+        ]
+        forecast = _forecaster.predict_demand(product["_id"], historical, forecast_days=horizon)
+        values = [d.get("predicted_quantity", 0.0) for d in forecast.predictions]
+        advice = restock_advice(
+            product.get("stock_kg", 0.0),
+            values,
+            safety_stock=safety_stock,
+            target_days=target_days,
+        )
+        recommendations.append({
+            "product_id": product["_id"],
+            "product_name": product.get("name", ""),
+            "current_stock_kg": round(float(product.get("stock_kg", 0.0)), 1),
+            **advice,
+        })
+    order_priority = {"critical": 0, "high": 1, "low_stock": 2, "ok": 3, "none": 4}
+    recommendations.sort(key=lambda r: order_priority.get(r["priority"], 4))
+    return recommendations
 
 
 def _resolve_seller(
@@ -255,11 +353,42 @@ def list_products():
         query: dict = {}
         if category:
             query["category"] = category
-        if query_param:
-            query["name"] = {"$regex": query_param, "$options": "i"}
 
-        products = list(s["products"].find(query).limit(limit))
-        # Attach seller info to each product
+        if query_param:
+            # Semantic search: rank the full (category-filtered) catalog by
+            # embedding similarity, falling back to keyword matching when no
+            # product scores above the semantic threshold.
+            pool = list(s["products"].find(query).limit(500))
+            def _search_text(p):
+                return " ".join(filter(None, [
+                    str(p.get("name", "")),
+                    str(p.get("category", "")),
+                    str(p.get("description", "")),
+                ]))
+            docs = [_search_text(p) for p in pool]
+            scores = semantic_scores(query_param, docs)
+            ranked = sorted(zip(pool, scores), key=lambda t: t[1], reverse=True)
+            matched = [(p, sc) for p, sc in ranked if sc > 0.02]
+            if not matched:
+                kw = query_param.lower()
+                matched = [
+                    (p, sc) for p, sc in ranked
+                    if kw in (p.get("name", "") or "").lower()
+                    or kw in (p.get("description", "") or "").lower()
+                ]
+                if not matched:
+                    matched = [(p, sc) for p, sc in ranked if sc > 0.0]
+            products = [p for p, _ in matched[:limit]]
+        else:
+            products = list(s["products"].find(query).limit(limit))
+
+        # Attach seller info + per-seller live-stream engagement
+        live = {}
+        if include_dynamic:
+            live = {
+                seller_id: _seller_live_engagement(s, seller_id)
+                for seller_id in {p.get("seller_id") for p in products}
+            }
         for p in products:
             seller = _lookup_seller(s, p.get("seller_id"))
             if seller:
@@ -268,7 +397,16 @@ def list_products():
                     "username": seller.get("username", ""),
                     "location": seller.get("location", ""),
                 }
-        return _ok([_serialize_product(s, p, include_dynamic) for p in products])
+        response = [
+            _serialize_product(
+                s,
+                p,
+                include_dynamic,
+                live.get(p.get("seller_id")),
+            )
+            for p in products
+        ]
+        return _ok(response)
 
 
 @api_bp.get("/api/products/<int:product_id>")
@@ -284,7 +422,13 @@ def get_product(product_id):
                 "username": seller.get("username", ""),
                 "location": seller.get("location", ""),
             }
-        return _ok(_serialize_product(s, product))
+        return _ok(
+            _serialize_product(
+                s,
+                product,
+                live_engagement=_seller_live_engagement(s, product.get("seller_id")),
+            )
+        )
 
 
 @api_bp.post("/api/products")
@@ -836,6 +980,9 @@ def get_seller_analytics(seller_id):
             for p in products if p.get("stock_kg", 0) < 50
         ]
 
+        live_engagement = _seller_live_engagement(s, seller_id)
+        restock_recommendations = _restock_recommendations(s, seller_id)
+
         return _ok({
             "seller": user_to_dict(seller),
             "sales_summary": {
@@ -851,6 +998,10 @@ def get_seller_analytics(seller_id):
             },
             "demand_forecasts": forecasts,
             "low_stock_alerts": low_stock,
+            "live_engagement": (
+                round(live_engagement, 4) if live_engagement is not None else None
+            ),
+            "restock_recommendations": restock_recommendations,
         })
 
 
@@ -1144,6 +1295,11 @@ def get_seller_inventory(seller_id):
             return _err("seller not found or not a seller", 404)
 
         products = list(s["products"].find({"seller_id": seller_id}))
+        live_engagement = _seller_live_engagement(s, seller_id)
+        restock = {
+            r["product_id"]: r
+            for r in _restock_recommendations(s, seller_id)
+        }
         results = []
         for p in products:
             reviews = list(s["reviews"].find({"product_id": p["_id"]}))
@@ -1160,6 +1316,7 @@ def get_seller_inventory(seller_id):
                 demand_factor=demand,
                 stock_kg=p.get("stock_kg", 0.0),
                 sentiment_score=avg_sentiment,
+                live_engagement=live_engagement,
             )
 
             stock = p.get("stock_kg", 0)
@@ -1178,7 +1335,12 @@ def get_seller_inventory(seller_id):
                 "product": product_to_dict(p),
                 "dynamic_price": calc.optimal_price,
                 "price_change_pct": calc.change_pct,
+                "live_engagement": (
+                    round(live_engagement, 4) if live_engagement is not None else None
+                ),
+                "live_price_boost_pct": round(calc.live_factor * 100, 2),
                 "status": status,
+                "restock": restock.get(p["_id"]),
             })
 
         return _ok(results)

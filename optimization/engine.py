@@ -40,6 +40,7 @@ class PriceCalculation:
     change_pct: float
     capped: bool
     reason: str = "dynamic pricing"
+    live_factor: float = 0.0
 
 
 @dataclass
@@ -204,7 +205,8 @@ class DynamicPricingEngine:
         base_price: float,
         demand_factor: float = 0.5,
         stock_kg: float = 0.0,
-        sentiment_score: float = 0.0
+        sentiment_score: float = 0.0,
+        live_engagement: Optional[float] = None
     ) -> PriceCalculation:
         """Calculate optimal price using the formula:
         Optimal Price = Base Price * (1 + Demand Factor - Stock Factor + Sentiment Factor)
@@ -230,10 +232,10 @@ class DynamicPricingEngine:
         if stock_kg > self.stock_high_threshold:
             # Excess stock: discount up to 10%
             excess_ratio = min(stock_kg / self.stock_high_threshold, 3.0)
-            stock_adj = -min(0.1, 0.05 * (excess_ratio - 1.0))
+            stock_adj = min(0.1, 0.05 * (excess_ratio - 1.0))
         elif stock_kg < 50.0:
             # Low stock: premium up to 10%
-            stock_adj = min(0.1, 0.05 * (50.0 / max(stock_kg, 1.0)))
+            stock_adj = -min(0.1, 0.05 * (50.0 / max(stock_kg, 1.0)))
         else:
             stock_adj = 0.0
 
@@ -241,8 +243,14 @@ class DynamicPricingEngine:
         # sentiment_score is -1 to 1, map to 0 to 0.05
         sentiment_adj = max(0.0, sentiment_score) * self.sentiment_boost_max
 
+        # Live-stream engagement factor: chat-driven demand signal, +/-5% swing.
+        # None means "no live signal" and stays fully neutral.
+        live_adj = 0.0
+        if live_engagement is not None:
+            live_adj = (max(0.0, min(1.0, float(live_engagement))) - 0.5) * 0.1
+
         # Calculate optimal price
-        multiplier = 1.0 + demand_adj - stock_adj + sentiment_adj
+        multiplier = 1.0 + demand_adj - stock_adj + sentiment_adj + live_adj
         optimal_price = base * multiplier
 
         # Cap within bounds
@@ -267,7 +275,8 @@ class DynamicPricingEngine:
             stock_factor=round(stock_adj, 4),
             sentiment_factor=round(sentiment_adj, 4),
             change_pct=change_pct,
-            capped=capped
+            capped=capped,
+            live_factor=round(live_adj, 4),
         )
 
 

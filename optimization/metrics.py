@@ -171,3 +171,98 @@ def rating_summary(reviews: List[dict]) -> Dict[str, Any]:
 def _sentiment_from_score(score: float) -> str:
     """Backward compat: legacy code called this."""
     return _sentiment_label(score)
+
+
+def _ts_of(message) -> datetime:
+    """Best-effort timestamp for a chat document (created_at or timestamp)."""
+    return _parse_ts(
+        _get_attr_or_dict(message, "created_at")
+        or _get_attr_or_dict(message, "timestamp")
+    )
+
+
+def stream_engagement_score(
+    messages: List[dict],
+    reference: datetime | None = None,
+    half_life_hours: float = 4.0,
+    max_expected: int = 40,
+) -> float:
+    """Live-stream purchase-intent demand signal in [0, 1] from chat messages.
+
+    This is the bridge from the semantic-NLP layer to the pricing engine: it
+    blends recency-weighted chat velocity with the share of *buying-signal*
+    intents (PRICE_INQUIRY / QUALITY_INQUIRY) and positive sentiment so a
+    seller's dynamic pricing can react to what buyers are saying live.
+    """
+    messages = list(messages or [])
+    if not messages:
+        return 0.0
+
+    now = reference or datetime.now(timezone.utc)
+    total_delta = 0.0
+    buy_signals = 0
+    positive_cumulative = 0.0
+    for message in messages:
+        created = _ts_of(message)
+        delta = (now - created).total_seconds() / 3600.0
+        total_delta += max(delta, 0.0)
+        intent = (_get_attr_or_dict(message, "intent_tag") or "") or ""
+        if intent in ("PRICE_INQUIRY", "QUALITY_INQUIRY"):
+            buy_signals += 1
+        positive_cumulative += max(
+            float(_get_attr_or_dict(message, "sentiment_score", 0.0) or 0.0), 0.0
+        )
+
+    avg_recency = math.exp(-(total_delta / len(messages)) / half_life_hours)
+    velocity = min(len(messages) / float(max_expected), 1.0)
+    buy_fraction = buy_signals / len(messages)
+    positivity = min(positive_cumulative / len(messages), 1.0)
+
+    return round(0.4 * avg_recency + 0.35 * buy_fraction + 0.25 * positivity, 4)
+
+
+def restock_advice(
+    stock_kg: float,
+    forecast_values: List[float],
+    safety_stock: float = 20.0,
+    target_days: float = 7.0,
+) -> Dict[str, Any]:
+    """Turn a demand forecast into a concrete reorder recommendation.
+
+    Uses the average daily forecast to estimate when current stock runs out and
+    recommends reordering to cover ``target_days`` of projected demand.
+    """
+    stock = max(0.0, float(stock_kg or 0.0))
+    values = [max(0.0, float(v or 0.0)) for v in (forecast_values or [])]
+    avg_daily = (sum(values) / len(values)) if values else 0.0
+
+    if avg_daily <= 0:
+        return {
+            "needs_restock": False,
+            "avg_daily_demand_kg": 0.0,
+            "days_until_out": None,
+            "recommended_reorder_kg": 0.0,
+            "priority": "none",
+        }
+
+    days_until_out = stock / avg_daily
+    stock_low = stock < safety_stock
+
+    if days_until_out <= 2:
+        priority = "critical"
+    elif days_until_out <= target_days:
+        priority = "high"
+    elif stock_low:
+        priority = "low_stock"
+    else:
+        priority = "ok"
+
+    recommended = max(target_days * avg_daily - stock, 0.0)
+
+    return {
+        "needs_restock": priority in ("critical", "high", "low_stock"),
+        "avg_daily_demand_kg": round(avg_daily, 2),
+        "days_until_out": round(days_until_out, 1),
+        "recommended_reorder_kg": round(recommended, 1),
+        "priority": priority,
+    }

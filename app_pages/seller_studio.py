@@ -48,10 +48,7 @@ from app_pages.api_helpers import (
     _api_post,
     badge_status,
     badge_sentiment,
-    badge_trend,
-    chart_sentiment_pie,
     material_symbol,
-    skeleton_card,
 )
 
 
@@ -87,26 +84,34 @@ def _load_stream_messages(stream_id: int, limit: int = 80) -> List[Dict[str, Any
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def _load_seller(seller_id: int) -> Optional[Dict[str, Any]]:
-    resp = _api_get(f"/api/seller/{seller_id}")
-    if not resp or not resp.get("ok"):
-        return None
-    return resp.get("data", {}).get("seller")
-
-
-@st.cache_data(ttl=30, show_spinner=False)
 def _load_inventory(seller_id: int) -> list[dict]:
     resp = _api_get(f"/api/seller/{seller_id}/inventory")
     if not resp or not resp.get("ok"):
         return []
     data = resp.get("data")
-    if isinstance(data, list):
-        return data
     if isinstance(data, dict):
         for key in ("inventory", "products", "data"):
             if isinstance(data.get(key), list):
-                return data[key]
-    return []
+                data = data[key]
+                break
+    if not isinstance(data, list):
+        return []
+
+    rows = []
+    for item in data:
+        product = dict(item.get("product") or item)
+        for extra in (
+            "status",
+            "dynamic_price",
+            "price_change_pct",
+            "live_engagement",
+            "live_price_boost_pct",
+            "restock",
+        ):
+            if extra in item:
+                product[extra] = item[extra]
+        rows.append(product)
+    return rows
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -124,6 +129,16 @@ def _load_orders(seller_id: int) -> list[dict]:
     return []
 
 
+def _restock_label(p: dict) -> str:
+    advice = p.get("restock") or {}
+    if not advice.get("needs_restock"):
+        return "—"
+    return (
+        f"{advice.get('recommended_reorder_kg', 0):.0f} kg "
+        f"({advice.get('days_until_out', 0):.0f} d left)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Page entry point
 # ---------------------------------------------------------------------------
@@ -138,9 +153,10 @@ def app() -> None:
         st.session_state.seller_id = 1
     _init("active_stream_id", None)
     _init("chat_messages", [])
+    _init("buyer_id", 3)
 
     with st.sidebar:
-        st.header(f"{MATERIAL_SYMBOLS['person']}  Seller Profile")
+        st.subheader(f"{MATERIAL_SYMBOLS['person']}  Seller Profile")
 
         st.number_input(
             "Seller ID",
@@ -154,14 +170,14 @@ def app() -> None:
             st.caption(f"{MATERIAL_SYMBOLS['person']}  {seller.get('username')}")
             st.caption(f"{MATERIAL_SYMBOLS['place']}  {seller.get('location')}")
 
-        st.divider()
+        st.space("small")
         if st.session_state.active_stream_id:
             st.success(
                 f"{MATERIAL_SYMBOLS['live_tv']}  Active stream #"
                 f"{st.session_state.active_stream_id}"
             )
         else:
-            st.info(
+            st.caption(
                 f"{MATERIAL_SYMBOLS['info']}  No active stream — "
                 f"start one from the panel below."
             )
@@ -179,21 +195,20 @@ def _seller_stream_panel() -> None:
     seller_id = st.session_state.seller_id
     stream_id = st.session_state.active_stream_id
 
-    st.divider()
-    st.subheader(f"{MATERIAL_SYMBOLS['video_camera_front']}  Stream Control")
+    st.subheader(f"{MATERIAL_SYMBOLS['video_camera_front']}  Stream control")
 
     col_start, col_end = st.columns(2)
 
     with col_start:
         stream_title = st.text_input(
-            f"{MATERIAL_SYMBOLS['live_tv']}  Stream Title",
+            f"{MATERIAL_SYMBOLS['live_tv']}  Stream title",
             placeholder="e.g. Fresh Harvest from Nashik — live now!",
             key="stream_title_input",
         )
         if st.button(
-            f"{MATERIAL_SYMBOLS['play_arrow']}  Start Stream",
+            f"{MATERIAL_SYMBOLS['play_arrow']}  Start stream",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         ):
             if not stream_title.strip():
                 st.error(f"{MATERIAL_SYMBOLS['warning']}  Please enter a stream title.")
@@ -219,9 +234,9 @@ def _seller_stream_panel() -> None:
     with col_end:
         if stream_id:
             if st.button(
-                f"{MATERIAL_SYMBOLS['stop']}  End Stream",
+                f"{MATERIAL_SYMBOLS['stop']}  End stream",
                 type="secondary",
-                use_container_width=True,
+                width="stretch",
             ):
                 resp = _api_post(f"/api/streams/{stream_id}/end", {})
                 if resp and resp.get("ok"):
@@ -238,9 +253,9 @@ def _seller_stream_panel() -> None:
 
     # Live chat panel
     if stream_id:
-        st.divider()
+        st.space("small")
         st.subheader(
-            f"{MATERIAL_SYMBOLS['live_tv']}  Live Chat — "
+            f"{MATERIAL_SYMBOLS['live_tv']}  Live chat — "
             f"{_get_stream(stream_id).get('stream_title', 'Untitled')}"
         )
         _render_stream_chat(stream_id)
@@ -277,10 +292,10 @@ def _render_stream_chat(stream_id: int) -> None:
     st.divider()
 
     prompt = st.chat_input("Type a message…", key=f"chat_input_{stream_id}")
-    if prompt and st.session_state.buyer_id:
+    if prompt and st.session_state.get("buyer_id"):
         resp = _api_post("/api/streams/send_message", {
             "stream_id": stream_id,
-            "user_id": st.session_state.buyer_id,
+            "user_id": st.session_state.get("buyer_id"),
             "message_text": prompt,
         })
         if resp and resp.get("ok"):
@@ -305,7 +320,6 @@ def _seller_inventory_orders_panel() -> None:
     )
 
     with tab_inventory:
-        st.divider()
         st.subheader(f"{MATERIAL_SYMBOLS['inventory_2']}  Inventory  ·  {MATERIAL_SYMBOLS['analytics']} Live")
 
         with st.status("Loading inventory…", expanded=False) as status:
@@ -314,29 +328,34 @@ def _seller_inventory_orders_panel() -> None:
             status.update(label="Inventory loaded.", state="complete")
 
         if inventory:
-            # Metrics row (#7 materials, #6 native badges)
             total_stock = sum(p.get("stock_kg") or 0 for p in inventory)
             low_stock = sum(1 for p in inventory if (p.get("stock_kg") or 0) < 50)
             out_of_stock = sum(1 for p in inventory if (p.get("stock_kg") or 0) <= 0)
             avg_price = sum(p.get("price") or 0 for p in inventory) / max(len(inventory), 1)
 
-            col_stock, col_low, col_oos, col_price = st.columns(4)
-            with col_stock:
+            with st.container(horizontal=True):
                 st.metric(
-                    f"{MATERIAL_SYMBOLS['inventory_2']}  Total Stock",
+                    f"{MATERIAL_SYMBOLS['inventory_2']} Total stock",
                     value=f"{total_stock:,.1f} kg",
+                    border=True,
                 )
-            with col_low:
-                badge_status(f"{low_stock} low-stock items", color="orange")
-            with col_oos:
-                badge_status(f"{out_of_stock} out-of-stock items", color="red")
-            with col_price:
                 st.metric(
-                    f"{MATERIAL_SYMBOLS['currency_rupee']}  Avg Price",
+                    f"{MATERIAL_SYMBOLS['warning']} Low stock",
+                    value=low_stock,
+                    border=True,
+                )
+                st.metric(
+                    f"{MATERIAL_SYMBOLS['cancel']} Out of stock",
+                    value=out_of_stock,
+                    border=True,
+                )
+                st.metric(
+                    f"{MATERIAL_SYMBOLS['currency_rupee']} Avg price",
                     value=f"₹{avg_price:.2f}/kg",
+                    border=True,
                 )
 
-            st.divider()
+            st.space("small")
             st.dataframe(
                 [
                     {
@@ -344,9 +363,15 @@ def _seller_inventory_orders_panel() -> None:
                         "Category": p.get("category", ""),
                         "Stock (kg)": f"{p.get('stock_kg', 0):.1f}",
                         "Price (₹/kg)": f"{p.get('price', 0):.2f}",
-                        "Rating": f"{p.get('rating', 0):.2f}  {MATERIAL_SYMBOLS['star']}",
+                        "Dynamic (₹/kg)": f"{p.get('dynamic_price', p.get('price', 0)):.2f}",
+                        "Live boost": (
+                            f"{p.get('live_price_boost_pct', 0):+.1f}%"
+                            if p.get("live_engagement") is not None else "—"
+                        ),
+                        "Restock (kg)": _restock_label(p),
                         "Status": (
                             "Out of stock" if (p.get("stock_kg") or 0) <= 0
+                            else "Critical" if (p.get("stock_kg") or 0) < 20
                             else "Low stock" if (p.get("stock_kg") or 0) < 50
                             else "In stock"
                         ),
@@ -354,11 +379,10 @@ def _seller_inventory_orders_panel() -> None:
                     for p in inventory
                 ],
                 hide_index=True,
-                use_container_width=True,
                 column_config={
                     "Status": st.column_config.TextColumn("Status"),
-                    "Rating": st.column_config.TextColumn("Rating"),
-                    "Price (₹/kg)": st.column_config.NumberColumn("Price (₹/kg)", format="₹%.2f"),
+                    "Dynamic (₹/kg)": st.column_config.NumberColumn("Dynamic (₹/kg)", format="₹%.2f"),
+                    "Price (₹/kg)": st.column_config.NumberColumn("Base (₹/kg)", format="₹%.2f"),
                     "Stock (kg)": st.column_config.NumberColumn("Stock (kg)", format="%.1f"),
                 },
             )
@@ -366,8 +390,7 @@ def _seller_inventory_orders_panel() -> None:
             st.info(f"{MATERIAL_SYMBOLS['info']}  No products listed yet. Add some from the marketplace!")
 
     with tab_orders:
-        st.divider()
-        st.subheader(f"{MATERIAL_SYMBOLS['shopping_cart']}  Recent Orders")
+        st.subheader(f"{MATERIAL_SYMBOLS['shopping_cart']}  Recent orders")
 
         with st.status("Loading orders…", expanded=False) as status:
             st.write("Fetching order history…")
@@ -375,31 +398,35 @@ def _seller_inventory_orders_panel() -> None:
             status.update(label="Orders loaded.", state="complete")
 
         if orders:
-            col_ord_cnt, col_rev = st.columns(2)
-            with col_ord_cnt:
+            with st.container(horizontal=True):
                 st.metric(
-                    f"{MATERIAL_SYMBOLS['shopping_cart']}  Total Orders",
+                    f"{MATERIAL_SYMBOLS['shopping_cart']} Total orders",
                     value=len(orders),
+                    border=True,
                 )
-            with col_rev:
                 total_revenue = sum(o.get("total_price", 0.0) for o in orders)
                 st.metric(
-                    f"{MATERIAL_SYMBOLS['currency_rupee']}  Total Revenue",
+                    f"{MATERIAL_SYMBOLS['currency_rupee']} Total revenue",
                     value=f"₹{total_revenue:,.2f}",
+                    border=True,
                 )
 
-            st.divider()
+            st.space("small")
             for o in orders[-10:]:
                 buyer = o.get("buyer", {}) or {}
-                badge_status("Delivered" if o.get("status") == "completed" else "Pending",
-                             color="green" if o.get("status") == "completed" else "orange")
-                st.markdown(
-                    f"{MATERIAL_SYMBOLS['person']}  **{buyer.get('username', 'Unknown')}**"
-                    f"  —  {MATERIAL_SYMBOLS['local_shipping']}  "
-                    f"{o.get('quantity_kg', 0):.1f} kg  "
-                    f"{MATERIAL_SYMBOLS['currency_rupee']}  ₹{o.get('total_price', 0):,.2f}"
-                    f"  ({o.get('ordered_at', '')[:19]})"
-                )
+                with st.container(border=True):
+                    badge_status(
+                        "Delivered" if o.get("status") == "completed" else "Pending",
+                        color="green" if o.get("status") == "completed" else "orange",
+                        icon="check_circle" if o.get("status") == "completed" else "schedule",
+                    )
+                    st.markdown(
+                        f"{MATERIAL_SYMBOLS['person']}  **{buyer.get('username', 'Unknown')}**"
+                        f"  —  {MATERIAL_SYMBOLS['local_shipping']}  "
+                        f"{o.get('quantity_kg', 0):.1f} kg  "
+                        f"{MATERIAL_SYMBOLS['currency_rupee']}  ₹{o.get('total_price', 0):,.2f}"
+                        f"  ({o.get('ordered_at', '')[:19]})"
+                    )
         else:
             st.caption(f"{MATERIAL_SYMBOLS['info']}  No orders yet.")
 

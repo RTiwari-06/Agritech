@@ -20,13 +20,9 @@ from app_pages.api_helpers import (
     _API,
     _api_get,
     badge_status,
-    badge_trend,
-    badge_rating,
-    chart_bar,
-    chart_sentiment_pie,
+    badge_sentiment,
     material_symbol,
     product_card_row,
-    skeleton_card,
 )
 
 
@@ -91,7 +87,7 @@ def app() -> None:
         st.session_state.products = []
 
     with st.sidebar:
-        st.header(f"{material_symbol('account_circle')}  Buyer")
+        st.subheader(f"{material_symbol('account_circle')}  Buyer")
 
         st.number_input(
             "Buyer ID",
@@ -105,7 +101,7 @@ def app() -> None:
             st.caption(f"{material_symbol('person')}  {buyer.get('username')}")
             st.caption(f"{material_symbol('mail')}  {buyer.get('email')}")
 
-        st.divider()
+        st.space("small")
         st.text_input(
             "Search products",
             value=st.session_state.search,
@@ -118,7 +114,7 @@ def app() -> None:
             ["All"] + categories,
             key="category",
         )
-        st.divider()
+        st.space("small")
         st.caption(f"{material_symbol('refresh')}  Live streams update every 15 s")
 
     # Fetch products (cached) — read filter values from session_state
@@ -144,12 +140,11 @@ def app() -> None:
     # Live streams section
     streams = _load_live_streams(active=True)
     if streams:
-        st.divider()
-        st.subheader(f"{material_symbol('live_tv')}  Live Shopping Streams")
+        st.subheader(f"{material_symbol('live_tv')}  Live shopping streams")
         for s in streams:
             _stream_card(s)
 
-    st.divider()
+    st.space("medium")
     st.subheader(f"{material_symbol('grass')}  Products  ·  {len(products)} listed")
     _product_grid(products)
 
@@ -159,43 +154,38 @@ def _stream_card(s: Dict[str, Any]) -> None:
     active = s.get("is_active", True)
     viewers = s.get("viewer_count", 0)
 
-    with st.expander(
-        f"{material_symbol('live_tv')}  {s.get('stream_title', 'Live stream')}",
-        expanded=True,
-    ):
-        st.caption(f"{material_symbol('person')}  Seller: {seller.get('username')}")
-        st.caption(f"{material_symbol('analytics')}  Viewers: {viewers}")
-        badge_status("LIVE" if active else "ENDED", color="green" if active else "red")
+    with st.container(border=True):
+        st.markdown(f"**{s.get('stream_title', 'Live stream')}**")
+        st.caption(
+            f"{material_symbol('person')} Seller: {seller.get('username', 'Unknown')}  ·  "
+            f"{material_symbol('analytics')} Viewers: {viewers}"
+        )
+        badge_status("LIVE" if active else "ENDED",
+                     color="green" if active else "red",
+                     icon="live_tv" if active else "stop")
 
         messages = _load_stream_messages(s["id"])
         if messages:
+            st.space("small")
             _chat_window(s["id"], messages)
 
 
 def _chat_window(stream_id: int, initial_messages: List[Dict[str, Any]]) -> None:
-    col_log, col_chat = st.columns([1, 4])
+    st.markdown(f"**{material_symbol('chat')}  Live chat**  ·  {material_symbol('schedule')} refresh 15 s")
+    _render_chat_messages(initial_messages)
 
-    with col_log:
-        st.markdown(f"**{material_symbol('live_tv')}  Live Chat**")
-        st.caption(f"{material_symbol('schedule')}  Refresh: 15 s")
-
-    with col_chat:
-        st.divider()
-        st.subheader(f"{material_symbol('chat')}  Stream Chat")
-        _render_chat_messages(initial_messages)
-
-        prompt = st.chat_input("Type a message…")
-        if prompt and st.session_state.buyer_id:
-            buyer_id = st.session_state.buyer_id
-            resp = _api_post("/api/streams/send_message", {
-                "stream_id": stream_id,
-                "user_id": buyer_id,
-                "message_text": prompt,
-            })
-            if resp and resp.get("ok"):
-                st.rerun()
-            else:
-                st.toast("Failed to send message.", icon="⚠️")
+    prompt = st.chat_input("Type a message…")
+    if prompt and st.session_state.buyer_id:
+        buyer_id = st.session_state.buyer_id
+        resp = _api_post("/api/streams/send_message", {
+            "stream_id": stream_id,
+            "user_id": buyer_id,
+            "message_text": prompt,
+        })
+        if resp and resp.get("ok"):
+            st.rerun()
+        else:
+            st.toast("Failed to send message.", icon=material_symbol("warning"))
 
 
 def _render_chat_messages(messages: List[Dict[str, Any]]) -> None:
@@ -204,8 +194,7 @@ def _render_chat_messages(messages: List[Dict[str, Any]]) -> None:
             user_name = msg.get("username") or f"User {msg.get('user_id')}"
             st.markdown(f"**{user_name}**: {msg.get('message_text', '')}")
             if msg.get("sentiment_label"):
-                st.markdown("---")
-                st.caption(f"Sentiment: {msg['sentiment_label']}  ({msg.get('sentiment_score', 0.0):.2f})")
+                badge_sentiment(msg["sentiment_label"], msg.get("sentiment_score", 0.0))
             if msg.get("intent_tag"):
                 st.caption(f"Intent: {msg['intent_tag']}")
 
@@ -218,8 +207,8 @@ def _product_grid(products: List[Dict[str, Any]]) -> None:
     cols = st.columns(2)
     for idx, p in enumerate(products):
         with cols[idx % 2]:
-            st.divider()
-            product_card_row(p, idx)
+            with st.container(border=True):
+                product_card_row(p, idx)
 
 
 def _api_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:

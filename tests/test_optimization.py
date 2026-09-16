@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from optimization.forecasting import forecast_demand, DemandForecaster
-from optimization.metrics import demand_score, rating_summary, revenue_by_day, sales_summary
+from optimization.metrics import demand_score, rating_summary, restock_advice, revenue_by_day, sales_summary, stream_engagement_score
 from optimization.pricing import DynamicPricingEngine
 from optimization.recommendation import RecommendationEngine
 
@@ -150,3 +150,95 @@ def test_pricing_engine_competitive_adjustment():
         competitor_min=5.0, competitor_max=8.0,
     )
     assert high.suggested_price <= 50.0 * (1 + engine.max_premium)
+
+
+def _chat(message: str, created_at: datetime, intent: str = "", score: float = 0.0):
+    return {
+        "message": message,
+        "created_at": created_at,
+        "intent_tag": intent,
+        "sentiment_score": score,
+    }
+
+
+def test_stream_engagement_buy_signals_beat_cold_chatter():
+    now = datetime.utcnow()
+    hot = [
+        _chat("price?", now - timedelta(minutes=1), "PRICE_INQUIRY", 0.7),
+        _chat("quality?", now - timedelta(minutes=2), "QUALITY_INQUIRY", 0.6),
+        _chat("great!", now - timedelta(minutes=3), "GENERAL", 0.9),
+    ]
+    cold = [
+        _chat("ok.", now - timedelta(hours=20), "GENERAL", 0.0),
+        _chat("hm", now - timedelta(hours=21), "GENERAL", 0.0),
+    ]
+    hot_score = stream_engagement_score(hot)
+    cold_score = stream_engagement_score(cold)
+    assert hot_score > cold_score
+    assert 0.0 <= hot_score <= 1.0
+
+
+def test_stream_engagement_empty_is_zero():
+    assert stream_engagement_score([]) == 0.0
+    assert stream_engagement_score(None) == 0.0
+
+
+def test_restock_advice_on_low_stock():
+    advice = restock_advice(10.0, [5.0, 6.0, 4.0, 5.0, 6.0, 5.0, 4.0], safety_stock=20.0, target_days=7.0)
+    assert advice["needs_restock"] is True
+    assert advice["recommended_reorder_kg"] > 0
+    assert advice["priority"] == "critical"
+
+
+def test_restock_advice_healthy_stock():
+    advice = restock_advice(500.0, [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0], safety_stock=20.0, target_days=7.0)
+    assert advice["needs_restock"] is False
+    assert advice["priority"] == "ok"
+
+
+def test_restock_advice_no_demand_is_neutral():
+    advice = restock_advice(10.0, [], safety_stock=20.0, target_days=7.0)
+    assert advice["needs_restock"] is False
+    assert advice["priority"] == "none"
+
+
+def test_pricing_live_engagement_boosts_price():
+    engine = DynamicPricingEngine()
+    neutral = engine.suggest_price(base_price=100.0, demand_score=0.5, stock_level=100)
+    live = engine.suggest_price(
+        base_price=100.0, demand_score=0.5, stock_level=100, live_engagement=1.0
+    )
+    assert live.suggested_price > neutral.suggested_price
+    assert abs(live.live_adjustment - 0.05) < 1e-9
+
+
+def test_pricing_live_engagement_discounts_dead_stream():
+    engine = DynamicPricingEngine()
+    neutral = engine.suggest_price(base_price=100.0, demand_score=0.5, stock_level=100)
+    live = engine.suggest_price(
+        base_price=100.0, demand_score=0.5, stock_level=100, live_engagement=0.0
+    )
+    assert live.suggested_price < neutral.suggested_price
+    assert abs(live.live_adjustment - (-0.05)) < 1e-9
+
+
+def test_pricing_live_none_is_neutral():
+    engine = DynamicPricingEngine()
+    suggestion = engine.suggest_price(base_price=100.0, demand_score=0.5, stock_level=100)
+    assert suggestion.live_adjustment == 0.0
+
+
+def test_runtime_engine_live_factor():
+    from optimization.engine import DynamicPricingEngine as RuntimeEngine
+
+    engine = RuntimeEngine()
+    neutral = engine.calculate_optimal_price(
+        product_id=1, base_price=10.0, demand_factor=0.5, stock_kg=100.0
+    )
+    boosted = engine.calculate_optimal_price(
+        product_id=1, base_price=10.0, demand_factor=0.5, stock_kg=100.0,
+        live_engagement=1.0,
+    )
+    assert neutral.live_factor == 0.0
+    assert boosted.live_factor == 0.05
+    assert boosted.optimal_price > neutral.optimal_price

@@ -1,6 +1,6 @@
 """NLP pipeline unit tests (run in the no-spaCy fallback path by default)."""
 
-from nlp.processing import clean_text, embed_text, extract_keywords, text_similarity, tokenize
+from nlp.processing import clean_text, embed_text, extract_keywords, semantic_scores, text_similarity, tokenize
 from nlp.sentiment import SentimentAnalyzer, analyze_sentiment, classify_label
 
 
@@ -66,3 +66,19 @@ def test_analyzer_instance_round_trips():
 
 def test_empty_sentiment_is_neutral():
     assert analyze_sentiment("") == {"label": "neutral", "score": 0.0, "magnitude": 0.0}
+
+
+def test_semantic_scores_ranks_similar_first():
+    docs = [
+        "fresh organic tomatoes straight from the farm",
+        "ripe red tomatoes ideal for cooking",
+        "handwoven wool carpets and rugs",
+    ]
+    scores = semantic_scores("buy fresh tomatoes", docs)
+    assert len(scores) == 3
+    assert scores[0] > scores[2]
+    assert scores[1] > scores[2]
+
+
+def test_semantic_scores_empty_docs():
+    assert semantic_scores("anything", []) == []

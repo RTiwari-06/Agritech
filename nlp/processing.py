@@ -142,3 +142,28 @@ def text_similarity(a: str, b: str) -> float:
     if denom == 0:
         return 0.0
     return float(np.dot(vec_a, vec_b) / denom)
+
+
+def semantic_scores(query: str, documents: List[str]) -> List[float]:
+    """Rank ``documents`` against ``query``; returns a score per document.
+
+    The query is embedded once; each document is embedded and scored by cosine
+    similarity so callers can rank a full catalog without re-embedding the
+    query, unlike repeated :func:`text_similarity` calls.
+    """
+    docs = list(documents or [])
+    if not docs:
+        return []
+    qv = embed_text(query or "")
+    qn = float(np.linalg.norm(qv))
+    if qn == 0:
+        return [0.0] * len(docs)
+    scores = []
+    for doc in docs:
+        dv = embed_text(doc)
+        denom = float(np.linalg.norm(dv))
+        if denom:
+            scores.append(float(np.dot(qv, dv) / (qn * denom)))
+        else:
+            scores.append(0.0)
+    return scores

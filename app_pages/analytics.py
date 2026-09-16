@@ -1,8 +1,7 @@
-"""Sales Analytics & Optimization Dashboard page.
+"""Sales analytics & optimization dashboard page.
 
-Shows seller revenue, sentiment analysis, demand forecasting, and
-inventory status — with skeletons while data loads (#4), session state
-for the selected seller (#5), native badges (#6), and Material Symbols (#7).
+Shows seller revenue, sentiment analysis, demand forecasting, live shopping
+signal and inventory status.
 """
 
 from __future__ import annotations
@@ -17,18 +16,13 @@ import streamlit as st
 from app_pages.api_helpers import (
     MATERIAL_SYMBOLS,
     _api_get,
-    _api_post,
-    badge_status,
-    badge_sentiment,
-    badge_trend,
     chart_sentiment_pie,
     material_symbol,
-    skeleton_card,
 )
 
 
 # ---------------------------------------------------------------------------
-# Cached loaders — #1
+# Cached loaders
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -43,25 +37,26 @@ def _load_analytics(seller_id: int) -> Optional[Dict[str, Any]]:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def _load_sentiment_detail(seller_id: int) -> Optional[Dict[str, Any]]:
-    resp = _api_get(f"/api/analytics/{seller_id}/sentiment")
+def _load_inventory(seller_id: int) -> List[Dict[str, Any]]:
+    resp = _api_get(f"/api/seller/{seller_id}/inventory")
     if not resp or not resp.get("ok"):
-        return None
-    return resp.get("data", {})
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def _load_demand(seller_id: int) -> Optional[Dict[str, Any]]:
-    resp = _api_get(f"/api/analytics/{seller_id}/demand")
-    if not resp or not resp.get("ok"):
-        return None
-    return resp.get("data", {})
+        return []
+    inv_data = resp.get("data") or []
+    if isinstance(inv_data, dict):
+        inv_data = inv_data.get("inventory") or inv_data.get("products") or []
+    rows = []
+    for item in (inv_data if isinstance(inv_data, list) else []):
+        product = dict(item.get("product") or item)
+        for key in ("status", "live_engagement", "live_price_boost_pct", "restock"):
+            if key in item:
+                product[key] = item[key]
+        rows.append(product)
+    return rows
 
 
 # ---------------------------------------------------------------------------
 # Chart helpers
 # --------------------------------------------------------------------------
-
 
 def _forecast_chart(forecasts: list[dict]) -> Optional[go.Figure]:
     """Plotly line chart of demand forecasts per product."""
@@ -89,13 +84,13 @@ def _forecast_chart(forecasts: list[dict]) -> Optional[go.Figure]:
             name=col,
         ))
     fig.update_layout(
-        title="Demand Forecast (2 data points per product)",
+        title="Demand forecast per product",
         xaxis_title="",
         yaxis_title="Demand (kg/day)",
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#E8EDF2"),
+        font=dict(color="#E8F1EC"),
     )
     return fig
 
@@ -110,15 +105,15 @@ def _revenue_chart(daily_data: list[dict]) -> Optional[go.Figure]:
         pd.DataFrame({"date": dates, "revenue": amounts}),
         x="date", y="revenue",
         color="revenue",
-        color_continuous_scale=["#00B4D8", "#48CAE4"],
+        color_continuous_scale=["#0F5F31", "#34D399"],
         labels={"date": ""},
     )
     fig.update_layout(
-        title="Daily Revenue (last 7 days)",
+        title="Daily revenue (last 7 days)",
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#E8EDF2"),
+        font=dict(color="#E8F1EC"),
         coloraxis_showscale=False,
     )
     return fig
@@ -130,37 +125,30 @@ def _revenue_chart(daily_data: list[dict]) -> Optional[go.Figure]:
 
 def app() -> None:
     """Sales analytics & optimization dashboard page."""
-    st.title(
-        f"{MATERIAL_SYMBOLS['analytics']} "
-        "Sales Analytics & Optimization Dashboard"
-    )
+    st.title(f"{material_symbol('analytics')} Sales analytics & optimization dashboard")
 
-    # #5  session_state for seller ID
     if "analytics_seller_id" not in st.session_state:
         st.session_state.analytics_seller_id = 1
 
     st.sidebar.number_input(
-        f"{MATERIAL_SYMBOLS['person']} Seller ID",
+        f"{material_symbol('person')} Seller ID",
         min_value=1,
         step=1,
         key="analytics_seller_id",
     )
     seller_id = st.session_state.analytics_seller_id
 
-    # ------------------------------------------------------------------
-    # #4  Skeleton while analytics data loads
-    # ------------------------------------------------------------------
     with st.status(
-        f"{MATERIAL_SYMBOLS['refresh']} Loading analytics for seller #{seller_id} ...",
+        f"{material_symbol('refresh')} Loading analytics for seller #{seller_id} ...",
         expanded=False,
     ) as status:
-        st.write(f"{MATERIAL_SYMBOLS['schedule']} Fetching orders, reviews, and forecasts ...")
+        st.write(f"{material_symbol('schedule')} Fetching orders, reviews, and forecasts ...")
         analytics = _load_analytics(seller_id)
-        status.update(label=f"{MATERIAL_SYMBOLS['check_circle']} Data loaded.", state="complete")
+        status.update(label=f"{material_symbol('check_circle')} Data loaded.", state="complete")
 
     if not analytics:
         st.warning(
-            f"{MATERIAL_SYMBOLS['warning']} "
+            f"{material_symbol('warning')} "
             "No analytics data available for this seller. "
             "Start selling to see metrics here."
         )
@@ -168,68 +156,116 @@ def app() -> None:
 
     # Seller info bar
     seller = analytics.get("seller", {})
-    st.divider()
-    c_left, c_right = st.columns([2, 1])
-    with c_left:
-        st.markdown(
-            f"{MATERIAL_SYMBOLS['store']} **Seller:** "
-            f"{seller.get('username', 'Unknown')} · "
-            f"{MATERIAL_SYMBOLS['place']} "
-            f"{seller.get('location', 'Unknown')}"
-        )
-    with c_right:
-        email = seller.get("email", "")
-        if email:
-            st.markdown(f"{MATERIAL_SYMBOLS['mail']} {email}")
+    with st.container(border=True):
+        c_left, c_right = st.columns([2, 1])
+        with c_left:
+            st.markdown(
+                f"{material_symbol('store')} **Seller:** "
+                f"{seller.get('username', 'Unknown')} · "
+                f"{material_symbol('place')} "
+                f"{seller.get('location', 'Unknown')}"
+            )
+        with c_right:
+            email = seller.get("email", "")
+            if email:
+                st.markdown(f"{material_symbol('mail')} {email}")
 
-    # ------------------------------------------------------------------
-    # Key metrics — top row
-    # ------------------------------------------------------------------
+    # Sections data
     sales = analytics.get("sales_summary", {})
     sentiment = analytics.get("sentiment_summary", {})
     forecasts = analytics.get("demand_forecasts", [])
     low_stock = analytics.get("low_stock_alerts", [])
+    live_engagement = analytics.get("live_engagement")
+    restock_recommendations = analytics.get("restock_recommendations", [])
 
-    st.divider()
-    st.subheader(f"{MATERIAL_SYMBOLS['chart_line']} Key Performance Metrics")
+    st.space("small")
+    st.subheader(f"{material_symbol('chart_line')} Key performance metrics")
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
+    with st.container(horizontal=True):
         st.metric(
-            label=f"{MATERIAL_SYMBOLS['currency_rupee']} Total Revenue",
+            label=f"{material_symbol('currency_rupee')} Total revenue",
             value=f"₹{sales.get('total_revenue', 0):,.2f}",
+            border=True,
         )
-    with c2:
         st.metric(
-            label=f"{MATERIAL_SYMBOLS['inventory_2']} Total Quantity",
+            label=f"{material_symbol('inventory_2')} Total quantity",
             value=f"{sales.get('total_quantity_kg', 0):,.1f} kg",
+            border=True,
         )
-    with c3:
         st.metric(
-            label=f"{MATERIAL_SYMBOLS['shopping_cart']} Total Orders",
+            label=f"{material_symbol('shopping_cart')} Total orders",
             value=sales.get("total_orders", 0),
+            border=True,
         )
-    with c4:
         st.metric(
-            label=f"{MATERIAL_SYMBOLS['trending_up']} Avg Order Value",
+            label=f"{material_symbol('trending_up')} Avg order value",
             value=f"₹{sales.get('avg_order_value', 0):,.2f}",
+            border=True,
         )
+        if live_engagement is not None:
+            st.metric(
+                label=f"{material_symbol('live_tv')} Live engagement",
+                value=f"{live_engagement:.1%}",
+                delta=f"{material_symbol('sentiment_satisfied')} buyer intention",
+                border=True,
+            )
 
     # ------------------------------------------------------------------
-    # Demand forecasting chart (#7 symbols)
+    # Live shopping signal + restock recommendations
     # ------------------------------------------------------------------
-    st.divider()
-    st.subheader(
-        f"{MATERIAL_SYMBOLS['trending_up']} "
-        "Demand Forecasting (Next 7 Days)"
-    )
+    if live_engagement is not None or restock_recommendations:
+        st.space("small")
+        with st.container(border=True):
+            st.markdown(f"**{material_symbol('live_tv')} Live shopping signal**")
+            if live_engagement is None:
+                st.caption(
+                    f"{material_symbol('info')} No active stream yet — "
+                    f"start a stream to surface a live purchasing-intent signal."
+                )
+            else:
+                st.caption(
+                    f"{material_symbol('chat')} Derived from chat velocity, "
+                    f"buying intent (price/quality asks), and sentiment in "
+                    f"your active stream."
+                )
+
+            st.space("small")
+            st.markdown(f"**{material_symbol('add_box')} Restock recommendations**")
+            if restock_recommendations:
+                for rec in restock_recommendations:
+                    priority = rec.get("priority", "none")
+                    icon = {
+                        "critical": "priority_high",
+                        "high": "warning",
+                        "low_stock": "inventory_2",
+                        "ok": "check_circle",
+                    }.get(priority, "info")
+                    color = {
+                        "critical": "red",
+                        "high": "orange",
+                        "low_stock": "yellow",
+                        "ok": "green",
+                    }.get(priority, "blue")
+                    line = (
+                        f"{rec.get('product_name', 'Unknown')} · "
+                        f"{rec.get('current_stock_kg', 0):.0f} kg in stock · "
+                        f"reorder {rec.get('recommended_reorder_kg', 0):.0f} kg"
+                    )
+                    st.badge(priority.upper(), icon=f":material/{icon}:", color=color)
+                    st.markdown(line)
+            else:
+                st.caption(f"{material_symbol('info')} No restock recommendations yet.")
+
+    # ------------------------------------------------------------------
+    # Demand forecasting
+    # ------------------------------------------------------------------
+    st.space("small")
+    st.subheader(f"{material_symbol('trending_up')} 7-day demand forecast")
 
     if forecasts:
         fig_fc = _forecast_chart(forecasts)
         if fig_fc:
-            st.plotly_chart(fig_fc, use_container_width=True)
-        else:
-            st.info(f"{MATERIAL_SYMBOLS['info']} No forecast data yet.")
+            st.plotly_chart(fig_fc, theme=None)
 
         n_cols = min(len(forecasts), 5)
         trend_cols = st.columns(n_cols)
@@ -249,190 +285,197 @@ def app() -> None:
                     label=fc.get("product_name", "Unknown")[:22],
                     value=f"{slope:+.2f} kg/day",
                     delta=f"{icon} {label}",
+                    border=True,
                 )
     else:
-        st.info(
-            f"{MATERIAL_SYMBOLS['info']} "
+        st.caption(
+            f"{material_symbol('info')} "
             "Not enough order history for demand forecasts. "
             "As orders accumulate, predictions will appear here."
         )
 
     # ------------------------------------------------------------------
-    # Sentiment analysis
+    # Buyer sentiment analysis
     # ------------------------------------------------------------------
-    st.divider()
-    st.subheader(f"{MATERIAL_SYMBOLS['star']} Buyer Sentiment Analysis")
+    st.space("small")
+    st.subheader(f"{material_symbol('star')} Buyer sentiment analysis")
+
+    sent_counts = sentiment.get("counts", {
+        "POSITIVE": 0, "NEUTRAL": 0, "NEGATIVE": 0
+    })
+    avg_sent = sentiment.get("average_score", 0)
 
     c_sent, c_gauge = st.columns([1, 1])
 
     with c_sent:
-        sent_counts = sentiment.get("counts", {
-            "POSITIVE": 0, "NEUTRAL": 0, "NEGATIVE": 0
-        })
         if sum(sent_counts.values()) > 0:
             fig_pie = chart_sentiment_pie(sent_counts)
             if fig_pie:
-                st.plotly_chart(fig_pie, use_container_width=True)
+                st.plotly_chart(fig_pie, theme=None)
         else:
-            st.info(f"{MATERIAL_SYMBOLS['info']} No reviews yet.")
+            st.caption(f"{material_symbol('info')} No reviews yet.")
 
     with c_gauge:
-        avg_sent = sentiment.get("average_score", 0)
         fig_gauge = go.Figure(
             go.Indicator(
                 mode="gauge+number",
                 value=avg_sent * 100,
                 title={
-                    "text": f"{MATERIAL_SYMBOLS['star']} Overall Sentiment",
+                    "text": "Overall sentiment",
                     "font": {"size": 14},
                 },
                 gauge={
                     "axis": {"range": [-100, 100], "tickwidth": 1},
-                    "bar": {"color": "#1f77b4"},
+                    "bar": {"color": "#34D399"},
                     "steps": [
-                        {"range": [-100, -30], "color": "#ffcdd2"},
-                        {"range": [-30, 30], "color": "#fff9c4"},
-                        {"range": [30, 100], "color": "#c8e6c9"},
+                        {"range": [-100, -30], "color": "#7F1D1D"},
+                        {"range": [-30, 30], "color": "#78716C"},
+                        {"range": [30, 100], "color": "#14532D"},
                     ],
                     "threshold": {
-                        "line": {"color": "red", "width": 2},
+                        "line": {"color": "#E8F1EC", "width": 2},
                         "thickness": 0.75,
                         "value": avg_sent * 100,
                     },
                 },
             )
         )
-        fig_gauge.update_layout(height=260)
-        st.plotly_chart(fig_gauge, use_container_width=True)
+        fig_gauge.update_layout(height=240, template="plotly_dark",
+                               paper_bgcolor="rgba(0,0,0,0)",
+                               font=dict(color="#E8F1EC"))
+        st.plotly_chart(fig_gauge, theme=None)
 
-        st.divider()
-        st.markdown(
-            f"{MATERIAL_SYMBOLS['schedule']} **Total Reviews:** "
-            f"{sentiment.get('total_reviews', 0)}"
-        )
-        st.markdown(
-            f"{MATERIAL_SYMBOLS['star']} **Average Score:** "
-            f"{avg_sent:.3f} / 1.000"
-        )
-
-        st.divider()
-        st.markdown(f"{MATERIAL_SYMBOLS['analytics']} **Sentiment Breakdown**")
+    sent_icon = {
+        "POSITIVE": "thumb_up",
+        "NEUTRAL": "mood",
+        "NEGATIVE": "thumb_down",
+    }
+    sent_color = {"POSITIVE": "green", "NEUTRAL": "yellow", "NEGATIVE": "red"}
+    with st.container(horizontal=True):
+        st.metric(f"{material_symbol('schedule')} Total reviews",
+                  value=sentiment.get("total_reviews", 0), border=True)
+        st.metric(f"{material_symbol('star')} Average score",
+                  value=f"{avg_sent:+.3f}", border=True)
         for label, count in sent_counts.items():
             if count > 0:
-                icon = {
-                    "POSITIVE": "thumb_up",
-                    "NEUTRAL": "mood",
-                    "NEGATIVE": "thumb_down",
-                }.get(label, "mood")
-                st.markdown(
-                    f"<span style='margin-right:16px;'>"
-                    f"{material_symbol(icon)} **{label}:** {count} reviews"
-                    f"</span>",
-                    unsafe_allow_html=True,
+                st.metric(
+                    label=f"{material_symbol(sent_icon[label])} {label.title()}",
+                    value=count,
+                    border=True,
                 )
 
     # ------------------------------------------------------------------
-    # Inventory status table — uses native status badge (#6)
+    # Inventory status
     # ------------------------------------------------------------------
-    st.divider()
-    st.subheader(f"{MATERIAL_SYMBOLS['inventory_2']} Inventory Status")
+    st.space("small")
+    st.subheader(f"{material_symbol('inventory_2')} Inventory status")
 
-    inv_resp = _api_get(f"/api/seller/{seller_id}/inventory")
-    inventory_data = (
-        inv_resp.get("inventory", [])
-        if inv_resp and inv_resp.get("ok")
-        else []
-    )
+    inventory_data = _load_inventory(seller_id)
 
     if inventory_data:
         rows: List[Dict[str, Any]] = []
-        for item in inventory_data:
-            prod = item.get("product", {})
+        for prod in inventory_data:
             stock_kg = prod.get("stock_kg") or 0
             if stock_kg <= 0:
-                status_text = f"{MATERIAL_SYMBOLS['cancel']} Out of Stock"
+                status_text = "Out of stock"
             elif stock_kg < 20:
-                status_text = f"{MATERIAL_SYMBOLS['warning']} Critical"
+                status_text = "Critical"
             elif stock_kg < 50:
-                status_text = f"{MATERIAL_SYMBOLS['warning']} Low"
+                status_text = "Low"
             elif stock_kg > 500:
-                status_text = f"{MATERIAL_SYMBOLS['trending_down']} Overstock"
+                status_text = "Overstock"
             else:
-                status_text = f"{MATERIAL_SYMBOLS['check_circle']} Good"
+                status_text = "Good"
+
+            advice = prod.get("restock") or {}
+            restock_text = (
+                f"{advice.get('recommended_reorder_kg', 0):.0f} kg reorder"
+                if advice.get("needs_restock")
+                else "—"
+            )
 
             rows.append({
                 "Product": prod.get("name", "Unknown"),
                 "Category": prod.get("category", "N/A"),
                 "Stock (kg)": f"{stock_kg:.1f}",
                 "Price (₹/kg)": f"₹{prod.get('price', 0):.2f}",
-                "Rating": f"{prod.get('rating', 0):.2f} {MATERIAL_SYMBOLS['star']}",
+                "Live boost": (
+                    f"{prod.get('live_price_boost_pct', 0):+.1f}%"
+                    if prod.get("live_engagement") is not None
+                    else "—"
+                ),
+                "Restock (kg)": restock_text,
+                "Rating": f"{prod.get('rating', 0):.2f}",
                 "Status": status_text,
             })
 
         st.dataframe(
             pd.DataFrame(rows),
-            use_container_width=True,
             hide_index=True,
             column_config={
-                "Status": st.column_config.TextColumn("Status", width="medium"),
+                "Stock (kg)": st.column_config.NumberColumn("Stock (kg)", format="%.1f"),
+                "Price (₹/kg)": st.column_config.NumberColumn("Price (₹/kg)", format="₹%.2f"),
             },
         )
 
         if low_stock:
-            st.divider()
-            st.error(
-                f"{MATERIAL_SYMBOLS['warning']} "
-                f"**{MATERIAL_SYMBOLS['warning']} Low Stock Alerts**"
-            )
-            for alert in low_stock:
-                product_name = alert.get("product_name", "Unknown Product")
-                stock_kg = alert.get("stock_kg", 0)
-                st.markdown(
-                    f"{MATERIAL_SYMBOLS['warning']} "
-                    f"**{product_name}** — Only {stock_kg:.1f} kg remaining!"
-                )
+            st.space("small")
+            with st.container(border=True):
+                for alert in low_stock:
+                    product_name = alert.get("product_name", "Unknown Product")
+                    stock_kg = alert.get("stock_kg", 0)
+                    st.badge("LOW STOCK", icon=":material/warning:", color="orange")
+                    st.markdown(
+                        f"{material_symbol('warning')} "
+                        f"**{product_name}** — only {stock_kg:.1f} kg remaining."
+                    )
     else:
-        st.info(
-            f"{MATERIAL_SYMBOLS['info']} "
+        st.caption(
+            f"{material_symbol('info')} "
             "No products listed yet. Add products from the Seller Studio."
         )
 
     # ------------------------------------------------------------------
     # Revenue trend chart
     # ------------------------------------------------------------------
-    st.divider()
-    st.subheader(f"{MATERIAL_SYMBOLS['trending_up']} Revenue Trend (Last 7 Days)")
+    st.space("small")
+    st.subheader(f"{material_symbol('trending_up')} Revenue trend (last 7 days)")
 
     daily_data = analytics.get("daily_revenue", [])
     fig_rev = _revenue_chart(daily_data)
     if fig_rev:
-        st.plotly_chart(fig_rev, use_container_width=True)
+        st.plotly_chart(fig_rev, theme=None)
     else:
         st.caption(
-            f"{MATERIAL_SYMBOLS['info']} "
+            f"{material_symbol('info')} "
             "Revenue tracking requires historical order data. "
             "As orders accumulate over time, this section will show "
             "daily/weekly revenue trends with a bar chart."
         )
 
     # ------------------------------------------------------------------
-    # Dynamic pricing recommendations for top products (#7 symbols)
+    # Dynamic pricing recommendations
     # ------------------------------------------------------------------
-    st.divider()
-    st.subheader(f"{MATERIAL_SYMBOLS['trending_up']} Dynamic Pricing Recommendations")
+    st.space("small")
+    st.subheader(f"{material_symbol('trending_up')} Dynamic pricing recommendations")
     st.caption(
-        f"{MATERIAL_SYMBOLS['info']} "
-        "Recommended prices based on demand, stock levels, and market trends."
+        f"{material_symbol('info')} "
+        "Recommended prices based on demand, stock levels, and live engagement."
     )
 
     if inventory_data:
-        pricing_cols = st.columns(min(len(rows), 4))
-        for i, row in enumerate(rows[:4]):
+        pricing_cols = st.columns(min(len(inventory_data), 4))
+        for i, prod in enumerate(inventory_data[:4]):
             with pricing_cols[i]:
                 st.metric(
-                    label=row["Product"][:22],
-                    value=row["Price (₹/kg)"],
-                    delta=f"{MATERIAL_SYMBOLS['chart_line']} Dynamic pricing applied",
+                    label=(prod.get("name") or "Unknown")[:22],
+                    value=f"₹{prod.get('price', 0):.2f}/kg",
+                    delta=(
+                        f"{prod.get('live_price_boost_pct', 0):+.1f}% live"
+                        if prod.get("live_engagement") is not None
+                        else f"{prod.get('price_change_pct', 0):+.1f}% dynamic"
+                    ),
+                    border=True,
                 )
     else:
-        st.caption(f"{MATERIAL_SYMBOLS['info']} No products to recommend prices for yet.")
+        st.caption(f"{material_symbol('info')} No products to recommend prices for yet.")
