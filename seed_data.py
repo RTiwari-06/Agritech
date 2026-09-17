@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 
 from config import Config
-from database.db import drop_all, init_db, get_db
+from database.db import drop_all, init_db, get_db, get_client, hash_password
 from database.models import (
     SentimentLabel,
     IntentTag,
@@ -293,6 +293,7 @@ def reset_and_seed() -> None:
             email=entry["email"],
             role=entry["role"],
             location=entry["location"],
+            password_hash=hash_password("demo-password-123"),
         )
         doc["_id"] = _next_id(db)
         doc.setdefault("created_at", _offset(hours=2).isoformat())
@@ -307,6 +308,7 @@ def reset_and_seed() -> None:
             email=entry["email"],
             role=entry["role"],
             location=entry["location"],
+            password_hash=hash_password("demo-password-123"),
         )
         doc["_id"] = _next_id(db)
         doc.setdefault("created_at", _offset(hours=2).isoformat())
@@ -426,7 +428,8 @@ def reset_and_seed() -> None:
     print(f"  Reviews: 20")
     print(f"  Chat Messages: {len(CHAT_MESSAGES)}")
     print(f"  Orders: {len(SAMPLE_ORDERS)}")
-    print(f"Database: {Config.MONGO_DB} (MongoDB via mongomock)")
+    repo = "mongomock" if "mongomock" in repr(get_client()) else "mongodb"
+    print(f"Database: {Config.MONGO_DB} (MongoDB via {repo})")
 
 
 def _next_id(db):

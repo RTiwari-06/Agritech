@@ -60,12 +60,14 @@ def make_user_doc(
     email: str,
     role: str = "buyer",
     location: str = "",
+    password_hash: str = "",
 ) -> dict:
     return {
         "username": username[:80],
         "email": email,
         "role": role,
         "location": location[:120],
+        "password_hash": password_hash,
         "created_at": _now_iso(),
     }
 
@@ -115,6 +117,7 @@ def make_chat_message_doc(
     sentiment_score: float = 0.0,
     sentiment_label: str = "NEUTRAL",
     intent_tag: str = "GENERAL_CHAT",
+    is_host: bool = False,
 ) -> dict:
     return {
         "stream_id": stream_id,
@@ -123,6 +126,7 @@ def make_chat_message_doc(
         "sentiment_score": float(sentiment_score),
         "sentiment_label": sentiment_label,
         "intent_tag": intent_tag,
+        "is_host": bool(is_host),
         "timestamp": _now_iso(),
     }
 
@@ -240,6 +244,7 @@ def chat_message_to_dict(doc: dict, username: str | None = None) -> dict:
         "sentiment_score": doc.get("sentiment_score", 0.0),
         "sentiment_label": doc.get("sentiment_label", "NEUTRAL"),
         "intent_tag": doc.get("intent_tag", "GENERAL_CHAT"),
+        "is_host": bool(doc.get("is_host", False)),
         "timestamp": doc.get("timestamp"),
     }
 

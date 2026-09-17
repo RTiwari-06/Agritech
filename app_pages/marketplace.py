@@ -1,13 +1,12 @@
-"""Agritech — marketplace page.
+"""Agritech — marketplace + live streams pages.
 
-Buyer-facing page: browse products, search, live stream chat, order placement.
+Buyer-facing: browse products, search, order placement (buyer accounts);
+plus a dedicated live-shopping page with per-stream chat that auto-refreshes
+via ``st.fragment(run_every=3)`` so new messages appear without a click.
 
-Improvements covered in this file:
-  #1  Caching layer — loaders use @st.cache_data
-  #5  session_state for persistent filter/seller state
-  #6  Native st.badge for status/price-change/rating badges
-  #7  Material Symbols instead of raw emoji in labels
-  #9  Native st.chat_message for stream chat
+Everything that mutates state is bound to the authenticated user:
+authorization headers come from ``api_helpers`` and the backend refuses to
+attribute orders/chat to anyone but the token's owner.
 """
 
 from __future__ import annotations
@@ -17,8 +16,9 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 
 from app_pages.api_helpers import (
-    _API,
     _api_get,
+    _api_post,
+    _current_user_id,
     badge_status,
     badge_sentiment,
     material_symbol,
@@ -27,7 +27,7 @@ from app_pages.api_helpers import (
 
 
 # ---------------------------------------------------------------------------
-# Cached loaders — #1
+# Cached loaders
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -60,7 +60,7 @@ def _load_live_streams(active: bool = True) -> List[Dict[str, Any]]:
     return []
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=2, show_spinner=False)
 def _load_stream_messages(stream_id: int, limit: int = 100) -> List[Dict[str, Any]]:
     resp = _api_get(f"/api/streams/{stream_id}/messages", {"limit": limit})
     if not resp or not resp.get("ok"):
@@ -69,37 +69,26 @@ def _load_stream_messages(stream_id: int, limit: int = 100) -> List[Dict[str, An
 
 
 # ---------------------------------------------------------------------------
-# Page entry point
+# Marketplace page
 # ---------------------------------------------------------------------------
 
 def app() -> None:
-    st.title(f"{material_symbol('store')}  Agritech Marketplace")
+    st.title(f"{material_symbol('store')}  Market & Shop")
 
-    # #5  Sidebar state — buyer login + filter state
-    # Defaults set via session_state BEFORE widget creation; widgets
-    # use `key=` only (no `value=`) so Streamlit 1.63's policy check
-    # doesn't warn about mixed sources.
-    if "buyer_id" not in st.session_state:
-        st.session_state.buyer_id = 3  # default seeded buyer
     if "search" not in st.session_state:
         st.session_state.search = ""
-    if "products" not in st.session_state:
-        st.session_state.products = []
 
     with st.sidebar:
         st.subheader(f"{material_symbol('account_circle')}  Buyer")
-
-        st.number_input(
-            "Buyer ID",
-            min_value=1,
-            step=1,
-            key="buyer_id",
-        )
-
-        buyer = _load_seller(st.session_state.buyer_id)
-        if buyer:
-            st.caption(f"{material_symbol('person')}  {buyer.get('username')}")
-            st.caption(f"{material_symbol('mail')}  {buyer.get('email')}")
+        user = _current_user_id()
+        if user:
+            buyer = _load_seller(user)
+            if buyer:
+                st.caption(f"{material_symbol('person')}  {buyer.get('username')}")
+                st.caption(f"{material_symbol('mail')}  {buyer.get('email')}")
+            st.caption(f"{material_symbol('verified')}  Authenticated via bearer token")
+        else:
+            st.caption("Sign in as a buyer to place orders.")
 
         st.space("small")
         st.text_input(
@@ -109,19 +98,14 @@ def app() -> None:
             placeholder="Tomato, spinach, Nashik...",
         )
         categories = sorted({p.get("category") for p in _load_products() if p.get("category")})
-        st.selectbox(
-            "Category",
-            ["All"] + categories,
-            key="category",
-        )
+        st.selectbox("Category", ["All"] + categories, key="category")
         st.space("small")
-        st.caption(f"{material_symbol('refresh')}  Live streams update every 15 s")
+        st.caption(f"{material_symbol('refresh')}  Products update every 30 s")
 
-    # Fetch products (cached) — read filter values from session_state
     search = st.session_state.search
     category = st.session_state.category
     products = _load_products()
-    st.session_state.products = products  # store full list for access by render fns
+    st.session_state.products = products
 
     if search:
         needle = search.lower()
@@ -132,21 +116,26 @@ def app() -> None:
             or needle in (p.get("seller", {}).get("username", "") or "").lower()
         ]
     if category != "All":
-        products = [
-            p for p in products
-            if p.get("category") == category
-        ]
+        products = [p for p in products if p.get("category") == category]
 
-    # Live streams section
+    st.space("small")
+
+    _product_grid(products, hint=f"{material_symbol('grass')}  Products  ·  {len(products)} listed")
+
+
+# ---------------------------------------------------------------------------
+# Live streams page
+# ---------------------------------------------------------------------------
+
+def live_streams_page() -> None:
+    st.title(f"{material_symbol('live_tv')}  Live shopping streams")
     streams = _load_live_streams(active=True)
-    if streams:
-        st.subheader(f"{material_symbol('live_tv')}  Live shopping streams")
-        for s in streams:
-            _stream_card(s)
+    if not streams:
+        st.info("No live streams right now — check back soon.")
+        return
 
-    st.space("medium")
-    st.subheader(f"{material_symbol('grass')}  Products  ·  {len(products)} listed")
-    _product_grid(products)
+    for s in streams:
+        _stream_card(s)
 
 
 def _stream_card(s: Dict[str, Any]) -> None:
@@ -160,46 +149,62 @@ def _stream_card(s: Dict[str, Any]) -> None:
             f"{material_symbol('person')} Seller: {seller.get('username', 'Unknown')}  ·  "
             f"{material_symbol('analytics')} Viewers: {viewers}"
         )
-        badge_status("LIVE" if active else "ENDED",
-                     color="green" if active else "red",
-                     icon="live_tv" if active else "stop")
+        badge_status(
+            "LIVE" if active else "ENDED",
+            color="green" if active else "red",
+            icon="live_tv" if active else "stop",
+        )
 
         messages = _load_stream_messages(s["id"])
-        if messages:
+        if messages or True:
             st.space("small")
-            _chat_window(s["id"], messages)
+            _chat_window(s["id"])
 
 
-def _chat_window(stream_id: int, initial_messages: List[Dict[str, Any]]) -> None:
-    st.markdown(f"**{material_symbol('chat')}  Live chat**  ·  {material_symbol('schedule')} refresh 15 s")
-    _render_chat_messages(initial_messages)
+@st.fragment(run_every=3)
+def _chat_window(stream_id: int) -> None:
+    """Live chat panel — auto-refreshes every 3 seconds via fragment."""
+    st.markdown(
+        f"**{material_symbol('chat')}  Live chat**  ·  "
+        f"{material_symbol('schedule')} auto-refresh 3 s"
+    )
+    messages = _load_stream_messages(stream_id)
+    _render_chat_messages(messages)
 
     prompt = st.chat_input("Type a message…")
-    if prompt and st.session_state.buyer_id:
-        buyer_id = st.session_state.buyer_id
-        resp = _api_post("/api/streams/send_message", {
-            "stream_id": stream_id,
-            "user_id": buyer_id,
-            "message_text": prompt,
-        })
-        if resp and resp.get("ok"):
-            st.rerun()
+    if prompt:
+        user_id = _current_user_id()
+        if not user_id:
+            st.toast("Sign in to join the conversation.", icon=material_symbol("warning"))
         else:
-            st.toast("Failed to send message.", icon=material_symbol("warning"))
+            resp = _api_post("/api/streams/send_message", {
+                "stream_id": stream_id,
+                "message_text": prompt,
+            })
+            if resp and resp.get("ok"):
+                st.rerun()
+            else:
+                st.toast("Failed to send message.", icon=material_symbol("warning"))
 
 
 def _render_chat_messages(messages: List[Dict[str, Any]]) -> None:
     for msg in messages[-40:]:
         with st.chat_message("user" if msg.get("is_host") else "assistant"):
             user_name = msg.get("username") or f"User {msg.get('user_id')}"
-            st.markdown(f"**{user_name}**: {msg.get('message_text', '')}")
+            host_tag = " 🎙️ Host" if msg.get("is_host") else ""
+            st.markdown(f"**{user_name}**{host_tag}: {msg.get('message_text', '')}")
             if msg.get("sentiment_label"):
                 badge_sentiment(msg["sentiment_label"], msg.get("sentiment_score", 0.0))
             if msg.get("intent_tag"):
                 st.caption(f"Intent: {msg['intent_tag']}")
 
 
-def _product_grid(products: List[Dict[str, Any]]) -> None:
+# ---------------------------------------------------------------------------
+# Product grid
+# ---------------------------------------------------------------------------
+
+def _product_grid(products: List[Dict[str, Any]], hint: str = "") -> None:
+    st.subheader(hint)
     if not products:
         st.info("No products match your filters. Try a different search.")
         return
@@ -209,18 +214,3 @@ def _product_grid(products: List[Dict[str, Any]]) -> None:
         with cols[idx % 2]:
             with st.container(border=True):
                 product_card_row(p, idx)
-
-
-def _api_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    import json
-    import urllib.request
-    url = f"{_API}{path}"
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read().decode("utf-8"))

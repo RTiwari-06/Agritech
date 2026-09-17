@@ -43,9 +43,9 @@ import streamlit as st
 
 from app_pages.api_helpers import (
     MATERIAL_SYMBOLS,
-    _API,
     _api_get,
     _api_post,
+    _current_user_id,
     badge_status,
     badge_sentiment,
     material_symbol,
@@ -75,7 +75,7 @@ def _load_seller(seller_id: int) -> Optional[Dict[str, Any]]:
     return resp.get("data", {}).get("seller")
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=2, show_spinner=False)
 def _load_stream_messages(stream_id: int, limit: int = 80) -> List[Dict[str, Any]]:
     resp = _api_get(f"/api/streams/{stream_id}/messages", {"limit": limit})
     if not resp or not resp.get("ok"):
@@ -144,31 +144,29 @@ def _restock_label(p: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def app() -> None:
-    """Seller Live Host Studio page."""
+    """Seller Live Host Studio page — bound to the authenticated seller."""
     st.title(
         f"{MATERIAL_SYMBOLS['video_camera_front']}  Seller Live Host Studio"
     )
 
-    if "seller_id" not in st.session_state:
-        st.session_state.seller_id = 1
+    seller_id = _current_user_id()
+    if not seller_id:
+        st.warning(f"{material_symbol('warning')}  Sign in as a seller to use the studio.")
+        return
+    st.session_state.seller_id = seller_id
     _init("active_stream_id", None)
     _init("chat_messages", [])
-    _init("buyer_id", 3)
 
     with st.sidebar:
         st.subheader(f"{MATERIAL_SYMBOLS['person']}  Seller Profile")
 
-        st.number_input(
-            "Seller ID",
-            min_value=1,
-            step=1,
-            key="seller_id",
-        )
-
-        seller = _load_seller(st.session_state.seller_id)
+        seller = _load_seller(seller_id)
         if seller:
-            st.caption(f"{MATERIAL_SYMBOLS['person']}  {seller.get('username')}")
-            st.caption(f"{MATERIAL_SYMBOLS['place']}  {seller.get('location')}")
+            st.caption(f"{material_symbol('person')}  {seller.get('username')}")
+            st.caption(f"{material_symbol('place')}  {seller.get('location')}")
+        else:
+            st.caption("Seller profile unavailable.")
+        st.caption(f"{material_symbol('verified')}  Authenticated via bearer token")
 
         st.space("small")
         if st.session_state.active_stream_id:
@@ -214,11 +212,10 @@ def _seller_stream_panel() -> None:
                 st.error(f"{MATERIAL_SYMBOLS['warning']}  Please enter a stream title.")
                 return
             resp = _api_post("/api/streams", {
-                "seller_id": seller_id,
                 "stream_title": stream_title.strip(),
             })
             if resp and resp.get("ok"):
-                new_stream = resp.get("data", {}).get("stream", {})
+                new_stream = resp["data"]
                 st.session_state.active_stream_id = new_stream.get("id")
                 st.session_state.chat_messages = []
                 st.success(
@@ -254,9 +251,10 @@ def _seller_stream_panel() -> None:
     # Live chat panel
     if stream_id:
         st.space("small")
+        stream_meta = _get_stream(stream_id) or {}
         st.subheader(
             f"{MATERIAL_SYMBOLS['live_tv']}  Live chat — "
-            f"{_get_stream(stream_id).get('stream_title', 'Untitled')}"
+            f"{stream_meta.get('stream_title', 'Untitled')}"
         )
         _render_stream_chat(stream_id)
     else:
@@ -270,36 +268,40 @@ def _get_stream(stream_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
+@st.fragment(run_every=3)
 def _render_stream_chat(stream_id: int) -> None:
-    """Render live chat with native ``st.chat_message`` (#9)."""
-    # Re-fetch on every rerun so new messages appear
-    messages = _load_stream_messages(stream_id)
-    # Only update chat_messages if no chat widgets have been rendered yet on this run.
-    # After st.chat_message / st.chat_input are called, Streamlit locks the key.
-    if "chat_input_" not in str(st.session_state):
-        st.session_state.chat_messages = messages
+    """Render live chat with native ``st.chat_message`` (#9).
 
-    for msg in st.session_state.chat_messages[-40:]:
+    Runs in a fragment that auto-refreshes every 3 seconds so the host sees
+    new buyer messages without clicking.  Cache TTL for the message loader is
+    2 s, so every fragment refresh pulls fresh rows.
+    """
+    st.caption(f"{material_symbol('schedule')}  auto-refresh 3 s")
+
+    messages = _load_stream_messages(stream_id)
+    if not messages:
+        st.caption("No messages yet — say hello to your viewers!")
+
+    for msg in messages[-40:]:
         with st.chat_message("user" if msg.get("is_host") else "assistant"):
             user_name = msg.get("username") or f"User {msg.get('user_id')}"
-            st.markdown(f"**{user_name}**: {msg.get('message_text', '')}")
+            host_tag = f"  {material_symbol('mic')} Host" if msg.get("is_host") else ""
+            st.markdown(f"**{user_name}**{host_tag}: {msg.get('message_text', '')}")
             if msg.get("sentiment_label"):
-                st.markdown("---")
                 badge_sentiment(msg["sentiment_label"], msg.get("sentiment_score", 0.0))
             if msg.get("intent_tag"):
                 st.caption(f"Intent: {msg['intent_tag']}")
 
-    st.divider()
-
     prompt = st.chat_input("Type a message…", key=f"chat_input_{stream_id}")
-    if prompt and st.session_state.get("buyer_id"):
+    if prompt:
         resp = _api_post("/api/streams/send_message", {
             "stream_id": stream_id,
-            "user_id": st.session_state.get("buyer_id"),
             "message_text": prompt,
+            "is_host": True,
         })
         if resp and resp.get("ok"):
-            st.rerun()
+            _load_stream_messages.clear()
+            st.rerun(scope="fragment")
         else:
             st.toast("Failed to send message.", icon=material_symbol("warning"))
 
@@ -429,22 +431,3 @@ def _seller_inventory_orders_panel() -> None:
                     )
         else:
             st.caption(f"{MATERIAL_SYMBOLS['info']}  No orders yet.")
-
-
-def _api_post(path: str, payload: dict) -> dict:
-    import json
-    import urllib.request
-
-    url = f"{_API}{path}"
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read().decode("utf-8"))

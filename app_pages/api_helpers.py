@@ -15,6 +15,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Dict, List, Optional
 
 import plotly.express as px
@@ -82,6 +83,12 @@ MATERIAL_SYMBOLS: Dict[str, str] = {
     "arrow_drop_down": "arrow_drop_down",
     "home": "home",
     "contact_page": "contact_page",
+    "logout": "logout",
+    "lock_open": "lock_open",
+    "person_add": "person_add",
+    "monitoring": "monitoring",
+    "co2": "co2",
+    "verified": "verified",
 }
 
 
@@ -91,30 +98,62 @@ def material_symbol(name: str, fallback: str = "circle") -> str:
     return f":material/{n}:"
 
 
+# ---------------------------------------------------------------------------
+# Auth-aware HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _auth_token() -> Optional[str]:
+    """Current bearer token stored from the login screen, or None."""
+    token = st.session_state.get("auth_token")
+    return str(token) if token else None
+
+
+def current_user() -> Optional[Dict[str, Any]]:
+    """The authenticated user dict cached in session state, or None."""
+    if st.session_state.get("auth_token") and st.session_state.get("auth_user"):
+        return st.session_state["auth_user"]
+    return None
+
+
+def _auth_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    headers = {"Accept": "application/json"}
+    token = _auth_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 def _api_get(
     path: str,
     params: Optional[Dict[str, Any]] = None,
     ttl: int = 20,
     show_spinner: bool = False,
 ) -> Dict[str, Any]:
-    """Cached GET to the backend.  The cache key is (path, params)."""
+    """Cached GET to the backend.
+
+    The cache key includes the auth token so one user's cached rows can never
+    leak into another user's session.
+    """
 
     @st.cache_data(ttl=ttl, show_spinner=show_spinner)
-    def _inner(url: str) -> Optional[Dict[str, Any]]:
+    def _inner(url: str, token: Optional[str]) -> Optional[Dict[str, Any]]:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"Accept": "application/json"},
+                headers=_auth_headers(),
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.HTTPError, urllib.error.URLError, OSError):
             return None
 
+    token = _auth_token()
     url = f"{_API}{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params, doseq=True)
-    return _inner(url)
+    return _inner(url, token)
 
 
 def _api_post(
@@ -123,22 +162,69 @@ def _api_post(
     ttl: int = 0,
     show_spinner: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """POST to the backend (no caching — side-effect)."""
+    """POST to the backend (no caching — side-effect).
+
+    On HTTP errors the server's JSON body (``{"ok": false, "error": ...}``)
+    is returned so callers can show the real message; ``None`` is returned
+    only for network-level failures.
+    """
     url = f"{_API}{path}"
     body = json.dumps(data).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+        headers=_auth_headers({"Content-Type": "application/json"}),
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except (ValueError, OSError):
+            return {"ok": False, "error": f"HTTP {exc.code}"}
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"[api_helpers] {path} error: {exc}")
+        return None
+
+
+def _api_upload(
+    path: str, filename: str, file_bytes: bytes, extra: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """Multipart POST for market-report uploads (PDF/CSV)."""
+    boundary = "----AgritechBoundary" + uuid.uuid4().hex
+    body_parts = []
+    if extra:
+        for key, value in extra.items():
+            body_parts.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'
+            )
+    body_parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    )
+    body = "".join(body_parts).encode("utf-8") + file_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(
+        f"{_API}{path}",
+        data=body,
+        headers=_auth_headers({
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except (ValueError, OSError):
+            return {"ok": False, "error": f"HTTP {exc.code}"}
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"[api_helpers] {path} upload error: {exc}")
         return None
 
 
@@ -279,16 +365,13 @@ def product_card_row(product: Dict[str, Any], index: int) -> None:
         badge_status(status_key, color=status_color, icon=status_icon)
 
     with col_action:
-        buyer_id = st.session_state.get("buyer_id")
-        if buyer_id:
-            api_url = f"/api/orders"
-
+        user = current_user()
+        if user and user.get("role") == "buyer":
             def _place_order():
                 item = product
                 _api_post(
-                    api_url,
+                    "/api/orders",
                     {
-                        "buyer_id": int(buyer_id),
                         "product_id": int(product["id"]),
                         "quantity_kg": 1.0,
                         "price_per_kg": item.get("price", 0.0),
@@ -415,10 +498,10 @@ def chart_sentiment_pie(sentiments: Dict[str, int]) -> None:
 
 
 def _current_user_id() -> Optional[int]:
-    """Return the current logged-in buyer ID from session state, or None."""
-    uid = st.session_state.get("buyer_id")
-    if uid and isinstance(uid, (int, float)) and not pd.isna(uid):
-        return int(uid)
+    """Return the authenticated user's id from session state, or None."""
+    user = current_user()
+    if user and user.get("id"):
+        return int(user["id"])
     return None
 
 

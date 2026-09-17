@@ -16,10 +16,29 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
 
 # Local configuration and generated databases
 .env
+AUTH.md
 data/*.db
+*.sqlite
+*.sqlite3
+
+# Local logs, reports, and runtime files
+*.log
+*.tmp
+*.bak
+
+# Downloaded market reports kept outside the tracked sample fixture
+/Market_Wise_Price_Arrival_*.pdf
 
 # Temporary data-loader files
 scripts/__load_agmarknet_tmp.py

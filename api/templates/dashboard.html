@@ -6,8 +6,29 @@
 <title>Agritech — Command Center</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌾</text></svg>">
 <link rel="stylesheet" href="/static/dashboard/dashboard.css">
+<style>
+  .login-overlay{position:fixed;inset:0;background:rgba(4,10,24,.88);display:flex;align-items:center;justify-content:center;z-index:100}
+  .login-card{background:#0d1b30;border:1px solid #2a3f5f;border-radius:14px;padding:28px 30px;width:340px;box-shadow:0 18px 50px rgba(0,0,0,.5)}
+  .login-card h2{margin:0 0 4px;font-size:20px}
+  .login-card p{margin:0 0 18px;color:#8aa3c4;font-size:13px}
+  .login-card input{display:block;width:100%;box-sizing:border-box;margin-bottom:12px}
+  .login-error{color:#ff9d9d;font-size:12px;min-height:16px;margin:0 0 8px}
+  #logout-btn{display:none}
+</style>
 </head>
 <body>
+
+<div class="login-overlay" id="login-overlay">
+  <div class="login-card">
+    <h2>🌾 Agritech Sign In</h2>
+    <p>Demo auth — use a seeded username/email.<br>Password for all seeds: <code>demo-password-123</code></p>
+    <input id="login-identifier" class="input" type="text" placeholder="username or email" autocomplete="username">
+    <input id="login-password" class="input" type="password" placeholder="password" autocomplete="current-password">
+    <p class="login-error" id="login-error"></p>
+    <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
+  </div>
+</div>
+
 <aside class="sidebar">
   <div class="brand">
     <div class="brand-icon">🌾</div>
@@ -35,6 +56,7 @@
     <h1 id="page-title">📊 Overview</h1>
     <div class="topbar-right">
       <button class="btn ghost" id="refresh-btn" title="Refresh all data">🔄 Refresh</button>
+      <button class="btn ghost" id="logout-btn" title="Sign out">👤 Sign out</button>
       <div id="clock" class="clock"></div>
     </div>
   </header>

@@ -16,18 +16,19 @@ import streamlit as st
 from app_pages.api_helpers import (
     MATERIAL_SYMBOLS,
     _api_get,
+    _current_user_id,
     chart_sentiment_pie,
     material_symbol,
 )
 
 
 # ---------------------------------------------------------------------------
-# Cached loaders
+# Cached loaders — self-bound to the authenticated seller
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=30, show_spinner=False)
-def _load_analytics(seller_id: int) -> Optional[Dict[str, Any]]:
-    resp = _api_get(f"/api/analytics/{seller_id}")
+def _load_analytics() -> Optional[Dict[str, Any]]:
+    resp = _api_get("/api/analytics")
     if not resp or not resp.get("ok"):
         return None
     data = resp.get("data", {})
@@ -37,8 +38,8 @@ def _load_analytics(seller_id: int) -> Optional[Dict[str, Any]]:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def _load_inventory(seller_id: int) -> List[Dict[str, Any]]:
-    resp = _api_get(f"/api/seller/{seller_id}/inventory")
+def _load_inventory() -> List[Dict[str, Any]]:
+    resp = _api_get("/api/seller/inventory")
     if not resp or not resp.get("ok"):
         return []
     inv_data = resp.get("data") or []
@@ -124,26 +125,21 @@ def _revenue_chart(daily_data: list[dict]) -> Optional[go.Figure]:
 # ---------------------------------------------------------------------------
 
 def app() -> None:
-    """Sales analytics & optimization dashboard page."""
+    """Sales analytics & optimization dashboard page — bound to the seller."""
     st.title(f"{material_symbol('analytics')} Sales analytics & optimization dashboard")
 
-    if "analytics_seller_id" not in st.session_state:
-        st.session_state.analytics_seller_id = 1
-
-    st.sidebar.number_input(
-        f"{material_symbol('person')} Seller ID",
-        min_value=1,
-        step=1,
-        key="analytics_seller_id",
-    )
-    seller_id = st.session_state.analytics_seller_id
+    seller_id = _current_user_id()
+    if not seller_id:
+        st.warning(f"{material_symbol('warning')}  Sign in as a seller to view analytics.")
+        return
+    st.session_state.analytics_seller_id = seller_id
 
     with st.status(
         f"{material_symbol('refresh')} Loading analytics for seller #{seller_id} ...",
         expanded=False,
     ) as status:
         st.write(f"{material_symbol('schedule')} Fetching orders, reviews, and forecasts ...")
-        analytics = _load_analytics(seller_id)
+        analytics = _load_analytics()
         status.update(label=f"{material_symbol('check_circle')} Data loaded.", state="complete")
 
     if not analytics:
@@ -370,7 +366,7 @@ def app() -> None:
     st.space("small")
     st.subheader(f"{material_symbol('inventory_2')} Inventory status")
 
-    inventory_data = _load_inventory(seller_id)
+    inventory_data = _load_inventory()
 
     if inventory_data:
         rows: List[Dict[str, Any]] = []

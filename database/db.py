@@ -13,7 +13,10 @@ shapes they had under SQLAlchemy.
 """
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+import secrets
 from typing import Any, Generator
 
 import pymongo
@@ -95,6 +98,24 @@ def _ensure_collections(db: Database) -> None:
     if "price_logs" not in existing:
         db.create_collection("price_logs")
         db["price_logs"].create_index("product_id")
+
+    if "sessions" not in existing:
+        db.create_collection("sessions")
+        db["sessions"].create_index("token_hash", unique=True)
+        db["sessions"].create_index("user_id")
+
+    if "market_prices" not in existing:
+        db.create_collection("market_prices")
+        db["market_prices"].create_index(
+            [("commodity", 1), ("market", 1), ("market_date", 1)],
+            unique=True,
+        )
+        db["market_prices"].create_index("market_date")
+        db["market_prices"].create_index("synthetic")
+
+    if "market_ingest_log" not in existing:
+        db.create_collection("market_ingest_log")
+        db["market_ingest_log"].create_index("ingested_at")
 
     if "_counters" not in existing:
         db.create_collection("_counters")
@@ -216,6 +237,108 @@ def upsert_user(session: MongoSession, doc: dict) -> dict:
     if existing:
         return existing
     return _insert_one("users", doc, session.db)
+
+
+# ---------------------------------------------------------------------------
+# Authentication — demo/app auth: PBKDF2-SHA256 password hashing + DB bearer
+# sessions.  Production note: use httpOnly cookies/short-lived bearer tokens,
+# periodic expiry cleanup, rate limiting, TLS, and an env-configured secret.
+# ---------------------------------------------------------------------------
+
+_HASH_ALGO = "sha256"
+_ITERATIONS = 240_000
+_SESSION_TTL = timedelta(days=1)
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        _HASH_ALGO, password.encode("utf-8"), salt, _ITERATIONS
+    )
+    return f"pbkdf2${_HASH_ALGO}${_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        algo, name, iterations, salt_hex, digest_hex = password_hash.split("$")
+        if algo != "pbkdf2" or name != _HASH_ALGO:
+            return False
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac(
+            _HASH_ALGO, password.encode("utf-8"), salt, int(iterations)
+        )
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def authenticate_user(
+    session: MongoSession, identifier: str, password: str
+) -> dict | None:
+    user = session["users"].find_one(
+        {"$or": [{"email": identifier}, {"username": identifier}]}
+    )
+    if user is None:
+        return None
+    stored = user.get("password_hash") or ""
+    if not stored or not verify_password(password, stored):
+        return None
+    return user
+
+
+def create_login_session(
+    session: MongoSession, user_id: int, ttl: timedelta | None = None
+) -> str:
+    """Create a DB-backed bearer session; returns the raw token."""
+    token = secrets.token_urlsafe(32)
+    token_hash = _hash_token(token)
+    now = datetime.now(timezone.utc)
+    doc = {
+        "_id": _next_id(session.db),
+        "user_id": user_id,
+        "token_hash": token_hash,
+        "created_at": now.isoformat(),
+        "expires_at": (now + (ttl or _SESSION_TTL)).isoformat(),
+        "is_active": True,
+    }
+    session["sessions"].insert_one(doc)
+    return token
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def resolve_session(session: MongoSession, token: str) -> dict | None:
+    token_hash = _hash_token(token)
+    sess = session["sessions"].find_one({"token_hash": token_hash, "is_active": True})
+    if sess is None:
+        return None
+    expires_at = sess.get("expires_at")
+    if expires_at:
+        try:
+            expiry = datetime.fromisoformat(expires_at)
+        except ValueError:
+            expiry = None
+        if expiry is not None and expiry < datetime.now(timezone.utc):
+            session["sessions"].update_one(
+                {"_id": sess["_id"]}, {"$set": {"is_active": False}}
+            )
+            return None
+    user = session["users"].find_one({"_id": sess.get("user_id")})
+    if user is None:
+        return None
+    user["_session"] = sess
+    return user
+
+
+def revoke_session(session: MongoSession, token: str) -> None:
+    token_hash = _hash_token(token)
+    session["sessions"].update_many(
+        {"token_hash": token_hash, "is_active": True},
+        {"$set": {"is_active": False}},
+    )
 
 
 # ---------------------------------------------------------------------------

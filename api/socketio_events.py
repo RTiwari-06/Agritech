@@ -21,7 +21,7 @@ _nlp_engine = get_nlp_engine()
 STREAM_ROOM_PREFIX = "stream_"
 
 
-def build_stream_message_data(stream_id, user_id, message_text):
+def build_stream_message_data(stream_id, user_id, message_text, is_host=False):
     """Analyze, persist, and enrich a stream chat message.
 
     Shares a single NLP + persistence code path between the SocketIO
@@ -46,6 +46,7 @@ def build_stream_message_data(stream_id, user_id, message_text):
             sentiment_score=sentiment["sentiment_score"],
             sentiment_label=SentimentLabel(sentiment["sentiment_label"]).value,
             intent_tag=IntentTag(intent).value,
+            is_host=bool(is_host),
         )
         message_doc["_id"] = _next_id(s.db)
         message_doc.setdefault("created_at", _now_iso())
@@ -130,12 +131,13 @@ def register_socketio_handlers(socketio) -> None:
         stream_id = (data or {}).get("stream_id")
         user_id = (data or {}).get("user_id")
         message_text = (data or {}).get("message_text", "").strip()
+        is_host = bool((data or {}).get("is_host", False))
 
         if not stream_id or not user_id or not message_text:
             emit("error", {"message": "stream_id, user_id, and message_text required"})
             return
 
-        message_data = build_stream_message_data(stream_id, user_id, message_text)
+        message_data = build_stream_message_data(stream_id, user_id, message_text, is_host=is_host)
         if message_data is None:
             emit("error", {"message": "Invalid stream or user"})
             return
