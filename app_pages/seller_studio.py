@@ -45,7 +45,7 @@ from app_pages.api_helpers import (
     MATERIAL_SYMBOLS,
     _api_get,
     _api_post,
-    _current_user_id,
+    _current_seller_id,
     badge_status,
     badge_sentiment,
     material_symbol,
@@ -144,14 +144,14 @@ def _restock_label(p: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def app() -> None:
-    """Seller Live Host Studio page — bound to the authenticated seller."""
+    """Seller Live Host Studio page — acts as the demo seller identity."""
     st.title(
         f"{MATERIAL_SYMBOLS['video_camera_front']}  Seller Live Host Studio"
     )
 
-    seller_id = _current_user_id()
+    seller_id = _current_seller_id()
     if not seller_id:
-        st.warning(f"{material_symbol('warning')}  Sign in as a seller to use the studio.")
+        st.warning(f"{material_symbol('warning')}  Backend unreachable — restart it to use the studio.")
         return
     st.session_state.seller_id = seller_id
     _init("active_stream_id", None)
@@ -166,7 +166,6 @@ def app() -> None:
             st.caption(f"{material_symbol('place')}  {seller.get('location')}")
         else:
             st.caption("Seller profile unavailable.")
-        st.caption(f"{material_symbol('verified')}  Authenticated via bearer token")
 
         st.space("small")
         if st.session_state.active_stream_id:

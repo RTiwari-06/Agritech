@@ -16,14 +16,14 @@ import streamlit as st
 from app_pages.api_helpers import (
     MATERIAL_SYMBOLS,
     _api_get,
-    _current_user_id,
+    _current_seller_id,
     chart_sentiment_pie,
     material_symbol,
 )
 
 
 # ---------------------------------------------------------------------------
-# Cached loaders — self-bound to the authenticated seller
+# Cached loaders — demo seller identity
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -125,12 +125,12 @@ def _revenue_chart(daily_data: list[dict]) -> Optional[go.Figure]:
 # ---------------------------------------------------------------------------
 
 def app() -> None:
-    """Sales analytics & optimization dashboard page — bound to the seller."""
+    """Sales analytics & optimization dashboard page — demo seller identity."""
     st.title(f"{material_symbol('analytics')} Sales analytics & optimization dashboard")
 
-    seller_id = _current_user_id()
+    seller_id = _current_seller_id()
     if not seller_id:
-        st.warning(f"{material_symbol('warning')}  Sign in as a seller to view analytics.")
+        st.warning(f"{material_symbol('warning')}  Backend unreachable — restart it to view analytics.")
         return
     st.session_state.analytics_seller_id = seller_id
 

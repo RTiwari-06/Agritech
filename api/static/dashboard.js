@@ -13,43 +13,11 @@
   };
 
   // ---------------- API helpers ----------------
-  const TOKEN_KEY = "agritech_dash_token";
-  const USER_KEY = "agritech_dash_user";
-
-  let AUTH = { token: null, user: null };
-
-  function stashAuth(token, user) {
-    AUTH = { token, user };
-    try {
-      localStorage.setItem(TOKEN_KEY, token || "");
-      if (user) localStorage.setItem(USER_KEY, JSON.stringify(user));
-      else localStorage.removeItem(USER_KEY);
-    } catch (_) {}
-  }
-
-  function clearAuth() {
-    AUTH = { token: null, user: null };
-    try {
-      localStorage.removeItem(TOKEN_KEY);
-      localStorage.removeItem(USER_KEY);
-    } catch (_) {}
-  }
-
-  function authHeaders(extra = {}) {
-    const h = { ...extra };
-    if (AUTH.token) h["Authorization"] = `Bearer ${AUTH.token}`;
-    return h;
-  }
-
   async function api(path, opts = {}) {
-    const res = await fetch(path, { ...opts, headers: authHeaders(opts.headers) });
+    const res = await fetch(path, { ...opts, headers: { ...(opts.headers || {}) } });
     let body;
     try { body = await res.json(); } catch { body = {}; }
     if (!res.ok || body.ok === false) {
-      if (res.status === 401 && AUTH.token) {
-        clearAuth();
-        showLogin("Session expired — please sign in again.");
-      }
       throw new Error((body && body.error) || `${res.status} ${res.statusText}`);
     }
     return body.data;
@@ -157,20 +125,9 @@
     users = (await guard(() => api("/api/users"), "Could not load users")) || [];
     buyers = users.filter((u) => u.role === "buyer");
     sellers = users.filter((u) => u.role === "seller");
-    applyRoleScope();
     populateSelect("#mp-buyer", buyers, (u) => `#${u.id} ${u.username}`);
     populateSelect("#an-seller", sellers, (u) => `#${u.id} ${u.username}`);
     populateSelect("#inv-seller", sellers, (u) => `#${u.id} ${u.username}`);
-  }
-
-  // Ownership scoping: authenticated users may only operate on their own data.
-  function applyRoleScope() {
-    if (!AUTH.user) return;
-    if (AUTH.user.role === "buyer") {
-      buyers = buyers.filter((b) => b.id === AUTH.user.id);
-    } else if (AUTH.user.role === "seller") {
-      sellers = sellers.filter((s) => s.id === AUTH.user.id);
-    }
   }
 
   function populateSelect(sel, items, labelFn) {
@@ -277,10 +234,6 @@
   async function buyProduct(productId) {
     const qtyInput = $(`input[data-qty="${productId}"]`);
     const qty = qtyInput ? Number(qtyInput.value) : 1;
-    if (!AUTH.user || AUTH.user.role !== "buyer") {
-      toast("Sign in as a buyer to place orders", true);
-      return;
-    }
     const product = products.find((p) => p.id === productId);
     const ok = await guard(
       () => apiPost("/api/orders", { product_id: productId, quantity_kg: qty }),
@@ -372,7 +325,6 @@
     e.preventDefault();
     const text = $("#chat-text").value.trim();
     if (!text || !selectedStreamId) return;
-    if (!AUTH.token) { toast("Sign in to chat", true); return; }
     const ok = await guard(
       () => apiPost("/api/streams/send_message", {
         stream_id: selectedStreamId, message_text: text,
@@ -561,61 +513,8 @@
     }
   }
 
-  function showLogin(errorMsg = "") {
-    const overlay = $("#login-overlay");
-    if (overlay) overlay.style.display = "flex";
-    $("#logout-btn").style.display = "none";
-    $("#login-error").textContent = errorMsg || "";
-    if (errorMsg) toast(errorMsg, true);
-  }
-
-  async function doLogin() {
-    const identifier = $("#login-identifier").value.trim();
-    const password = $("#login-password").value;
-    if (!identifier || !password) return;
-    const res = await guard(
-      () => apiPost("/api/auth/login", { identifier, password }),
-      "Sign in failed"
-    );
-    if (res && res.token) {
-      $("#login-password").value = "";
-      stashAuth(res.token, res.user);
-      startApp();
-    }
-  }
-
-  async function logout() {
-    if (AUTH.token) {
-      await guard(() => apiPost("/api/auth/logout", {}), "Sign out failed");
-    }
-    clearAuth();
-    showLogin();
-    selectedStreamId = null;
-  }
-
   async function init() {
-    // Restore a previously stored session, re-validating against the API.
-    try {
-      const savedToken = localStorage.getItem(TOKEN_KEY);
-      if (savedToken) {
-        AUTH.token = savedToken;
-        const me = await guard(() => api("/api/auth/me"), "Session check");
-        if (me && me.user) {
-          AUTH.user = me.user;
-          stashAuth(savedToken, me.user);
-          startApp();
-          return;
-        }
-        clearAuth();
-      }
-    } catch (_) { /* fall through to login overlay */ }
-    showLogin();
-  }
-
-  function startApp() {
-    const overlay = $("#login-overlay");
-    if (overlay) overlay.style.display = "none";
-    $("#logout-btn").style.display = "";
+    // Auth layer removed: the dashboard boots straight into demo mode.
     wireUI();
     refresh();
   }
@@ -623,9 +522,6 @@
   function wireUI() {
     initNav();
     $("#refresh-btn").addEventListener("click", () => refresh());
-    $("#logout-btn").addEventListener("click", logout);
-    $("#login-btn").addEventListener("click", doLogin);
-    $("#login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
 
     $("#mp-apply").addEventListener("click", refresh.bind(null, "marketplace"));
     $("#orders-apply").addEventListener("click", refresh.bind(null, "orders"));

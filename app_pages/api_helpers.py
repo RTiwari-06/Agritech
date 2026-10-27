@@ -29,11 +29,16 @@ except Exception:
     Config.API_BASE_URL = "http://localhost:5000"
 
 
+def _api_base_url() -> str:
+    """Return the API base URL, reading fresh from Config each call."""
+    return getattr(Config, "API_BASE_URL", "http://localhost:5000").rstrip("/")
+
+
 # ---------------------------------------------------------------------------
 # Configuration & helpers
 # ---------------------------------------------------------------------------
 
-_API = getattr(Config, "API_BASE_URL", "http://localhost:5000").rstrip("/")
+_API = _api_base_url()
 
 
 # Material Symbols icon shorthand — central registry of icons the app uses
@@ -99,30 +104,58 @@ def material_symbol(name: str, fallback: str = "circle") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Auth-aware HTTP helpers
+# HTTP helpers + demo identities (auth layer removed)
 # ---------------------------------------------------------------------------
 
-def _auth_token() -> Optional[str]:
-    """Current bearer token stored from the login screen, or None."""
-    token = st.session_state.get("auth_token")
-    return str(token) if token else None
-
-
-def current_user() -> Optional[Dict[str, Any]]:
-    """The authenticated user dict cached in session state, or None."""
-    if st.session_state.get("auth_token") and st.session_state.get("auth_user"):
-        return st.session_state["auth_user"]
-    return None
-
-
-def _auth_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def _http_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     headers = {"Accept": "application/json"}
-    token = _auth_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     if extra:
         headers.update(extra)
     return headers
+
+
+def _ensure_identities() -> bool:
+    """Fetch the user directory once and pin the demo seller/buyer identities.
+
+    Returns ``False`` when the backend is unreachable (the caller should show a
+    connection error and stop).
+    """
+
+    @st.cache_data(ttl=30, show_spinner=False)
+    def _directory() -> Optional[list]:
+        resp = _api_get("/api/users", ttl=30)
+        if not resp or not resp.get("ok"):
+            return None
+        return resp.get("data")
+
+    if "demo_seller" not in st.session_state:
+        st.session_state.demo_seller = None
+    if "demo_buyer" not in st.session_state:
+        st.session_state.demo_buyer = None
+
+    if st.session_state.demo_seller or st.session_state.demo_buyer:
+        return True
+
+    users = _directory()
+    if users is None:
+        return False
+    st.session_state.demo_seller = next(
+        (u for u in users if u.get("role") == "seller"), None
+    )
+    st.session_state.demo_buyer = next(
+        (u for u in users if u.get("role") == "buyer"), None
+    )
+    return True
+
+
+def current_user() -> Optional[Dict[str, Any]]:
+    """Demo buyer identity — the user behind every buyer-side action."""
+    return st.session_state.get("demo_buyer")
+
+
+def current_seller() -> Optional[Dict[str, Any]]:
+    """Demo seller identity — the user behind every seller-side action."""
+    return st.session_state.get("demo_seller")
 
 
 def _api_get(
@@ -131,29 +164,24 @@ def _api_get(
     ttl: int = 20,
     show_spinner: bool = False,
 ) -> Dict[str, Any]:
-    """Cached GET to the backend.
-
-    The cache key includes the auth token so one user's cached rows can never
-    leak into another user's session.
-    """
+    """Cached GET to the backend."""
 
     @st.cache_data(ttl=ttl, show_spinner=show_spinner)
-    def _inner(url: str, token: Optional[str]) -> Optional[Dict[str, Any]]:
+    def _inner(url: str) -> Optional[Dict[str, Any]]:
         try:
             req = urllib.request.Request(
                 url,
-                headers=_auth_headers(),
+                headers=_http_headers(),
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.HTTPError, urllib.error.URLError, OSError):
             return None
 
-    token = _auth_token()
-    url = f"{_API}{path}"
+    url = f"{_api_base_url()}{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params, doseq=True)
-    return _inner(url, token)
+    return _inner(url)
 
 
 def _api_post(
@@ -168,12 +196,12 @@ def _api_post(
     is returned so callers can show the real message; ``None`` is returned
     only for network-level failures.
     """
-    url = f"{_API}{path}"
+    url = f"{_api_base_url()}{path}"
     body = json.dumps(data).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
-        headers=_auth_headers({"Content-Type": "application/json"}),
+        headers=_http_headers({"Content-Type": "application/json"}),
         method="POST",
     )
     try:
@@ -210,7 +238,7 @@ def _api_upload(
     req = urllib.request.Request(
         f"{_API}{path}",
         data=body,
-        headers=_auth_headers({
+        headers=_http_headers({
             "Content-Type": f"multipart/form-data; boundary={boundary}",
         }),
         method="POST",
@@ -365,8 +393,8 @@ def product_card_row(product: Dict[str, Any], index: int) -> None:
         badge_status(status_key, color=status_color, icon=status_icon)
 
     with col_action:
-        user = current_user()
-        if user and user.get("role") == "buyer":
+        buyer = current_user()
+        if buyer:
             def _place_order():
                 item = product
                 _api_post(
@@ -380,19 +408,13 @@ def product_card_row(product: Dict[str, Any], index: int) -> None:
                 st.rerun()
 
             st.button(
-                f"{material_symbol('shopping_cart')}  Buy 1 kg",
+                f"{material_symbol('shopping_cart')}  Buy 1 kg as {buyer.get('username', '')}",
                 key=f"buy_{product['id']}_{index}",
                 width="stretch",
                 on_click=_place_order,
             )
         else:
-            st.button(
-                f"{material_symbol('lock')}  Login to buy",
-                key=f"login_{product['id']}_{index}",
-                width="stretch",
-                type="secondary",
-                disabled=True,
-            )
+            st.caption("Backend unavailable — restart it to place orders.")
 
 
 def _stock_status(stock_kg: float) -> tuple[str, str, str]:
@@ -498,10 +520,18 @@ def chart_sentiment_pie(sentiments: Dict[str, int]) -> None:
 
 
 def _current_user_id() -> Optional[int]:
-    """Return the authenticated user's id from session state, or None."""
+    """Return the demo buyer's id, or None when the backend is unreachable."""
     user = current_user()
     if user and user.get("id"):
         return int(user["id"])
+    return None
+
+
+def _current_seller_id() -> Optional[int]:
+    """Return the demo seller's id, or None when the backend is unreachable."""
+    seller = current_seller()
+    if seller and seller.get("id"):
+        return int(seller["id"])
     return None
 
 

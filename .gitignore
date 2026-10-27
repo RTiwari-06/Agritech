@@ -1,7 +1,93 @@
-# Streamlit secrets (local credentials — not committed)
+# --- Streamlit secrets (local credentials — not committed) ---
 frontend/.streamlit/secrets.toml
 .streamlit/secrets.toml
+**/secrets.toml
 
+# --- Environment & config ---
+.env
+.env.local
+.env.*.local
+*.env
+
+# --- Python ---
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+build/
+dist/
+*.whl
+*.so
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# --- Testing & coverage ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+*.cover
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Node / Frontend (future React SPA per diverge.md) ---
+node_modules/
+apps/web/node_modules/
+apps/web/dist/
+apps/web/build/
+apps/web/.vite/
+.pnp/
+.pnp.js
+.npm/
+.pnpm-store/
+
+# --- OS generated ---
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- IDE ---
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# --- Local databases & generated data ---
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+*.sqlite
+*.sqlite3
+*.db
+
+
+# --- App specific ---
 # Streamlit frontend-specific caches
 frontend/.streamlit/cache/
 frontend/.streamlit/frontend*.txt
@@ -10,35 +96,21 @@ frontend/.streamlit/frontend*.txt
 app_pages/__pycache__/
 app_pages/*.pyc
 
-# Python bytecode
-__pycache__/
-**/__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Local virtual environments
-.venv/
-venv/
-env/
-
-# Local configuration and generated databases
-.env
-AUTH.md
-data/*.db
-*.sqlite
-*.sqlite3
-
 # Local logs, reports, and runtime files
 *.log
+logs/
 *.tmp
 *.bak
+*.pid
 
 # Downloaded market reports kept outside the tracked sample fixture
 /Market_Wise_Price_Arrival_*.pdf
+data/samples/*.pdf
+!data/samples/.gitkeep
 
-# Temporary data-loader files
-scripts/__load_agmarknet_tmp.py
+# --- Docker ---
+.docker/
+
+# --- Misc ---
+*.bak
+*.orig

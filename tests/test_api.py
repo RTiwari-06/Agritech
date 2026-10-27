@@ -1,9 +1,13 @@
-"""REST API integration tests (in-memory SQLite, no external dependencies)."""
+"""REST API integration tests (MongoDB-backed, isolated via conftest.py).
+
+The auth layer has been removed: buyer-side requests act as the first seeded
+buyer and seller-side requests as the first seeded seller, so every test
+seeds a minimal user directory directly through the data layer.
+"""
 
 import pytest
 
 from api.app import create_app
-from config import Config
 from database.db import dispose as dispose_engines
 
 
@@ -13,6 +17,7 @@ def app():
     from database.db import drop_all, init_db
     drop_all()
     init_db()
+    _seed_users()
     application, _ = create_app()
     yield application
     dispose_engines()
@@ -23,35 +28,28 @@ def client(app):
     return app.test_client()
 
 
-# --- Auth helpers (DB bearer token demo-auth) --------------------------------------
-def _register(client, username: str, role: str) -> str:
-    resp = client.post(
-        "/api/auth/register",
-        json={
-            "username": username,
-            "email": f"{username}@example.com",
-            "password": "password123",
-            "role": role,
-        },
-    )
-    assert resp.status_code == 201, resp.get_json()
-    return resp.get_json()["data"]["token"]
+def _seed_users() -> None:
+    """Insert one seller + one buyer so demo identities resolve."""
+    from database.db import _next_id, session_scope
+    from database.models import make_user_doc
 
-
-def _seller_token(client) -> str:
-    if not hasattr(client, "_seller_token"):
-        client._seller_token = _register(client, "sel_api", "seller")
-    return client._seller_token
-
-
-def _buyer_token(client) -> str:
-    if not hasattr(client, "_buyer_token"):
-        client._buyer_token = _register(client, "buy_api", "buyer")
-    return client._buyer_token
-
-
-def _hdr(token: str):
-    return {"Authorization": f"Bearer {token}"}
+    with session_scope() as s:
+        seller = make_user_doc(
+            username="ramesh_organic_farms",
+            email="ramesh@organicfarms.in",
+            role="seller",
+            location="Nashik, Maharashtra",
+        )
+        seller["_id"] = _next_id(s.db)
+        s["users"].insert_one(seller)
+        buyer = make_user_doc(
+            username="priya_sharma",
+            email="priya.sharma@email.com",
+            role="buyer",
+            location="Mumbai, Maharashtra",
+        )
+        buyer["_id"] = _next_id(s.db)
+        s["users"].insert_one(buyer)
 
 
 # --- Health / basic ---------------------------------------------------------------
@@ -67,7 +65,6 @@ def test_health(client):
 def test_product_crud_flow(client):
     create_response = client.post(
         "/api/products",
-        headers=_hdr(_seller_token(client)),
         json={
             "name": "Cherry Tomatoes",
             "category": "vegetables",
@@ -77,7 +74,7 @@ def test_product_crud_flow(client):
             "keywords": "tomatoes, fresh",
         },
     )
-    assert create_response.status_code == 201
+    assert create_response.status_code == 201, create_response.get_json()
     product_id = create_response.get_json()["data"]["id"]
     assert product_id > 0
 
@@ -93,12 +90,17 @@ def test_product_crud_flow(client):
     assert not_found.status_code == 404
 
 
-def test_create_product_requires_name(client):
+def test_create_product_acts_as_demo_seller(client):
     response = client.post(
         "/api/products",
-        headers=_hdr(_seller_token(client)),
-        json={"price": 10},
+        json={"name": "Sweet Potatoes", "price": 3.0, "quantity": 40.0},
     )
+    assert response.status_code == 201
+    assert response.get_json()["data"]["seller"]["username"] == "ramesh_organic_farms"
+
+
+def test_create_product_requires_name(client):
+    response = client.post("/api/products", json={"price": 10})
     assert response.status_code == 400
 
 
@@ -107,7 +109,6 @@ def test_create_transaction(client):
     product_id = _create_product(client, name="Sweet Corn", price=1.00, quantity=50.0)
     response = client.post(
         "/api/transactions",
-        headers=_hdr(_buyer_token(client)),
         json={
             "product_id": product_id,
             "quantity": 10.0,
@@ -128,31 +129,15 @@ def test_insufficient_stock_rejected(client):
     product_id = _create_product(client, name="Kale", price=2.0, quantity=1.0)
     response = client.post(
         "/api/transactions",
-        headers=_hdr(_buyer_token(client)),
         json={"product_id": product_id, "quantity": 5.0, "buyer_name": "Test"},
     )
     assert response.status_code == 409
     assert "insufficient stock" in response.get_json()["error"].lower()
 
 
-def test_order_alias_requires_authentication(client):
-    product_id = _create_product(client, name="Auth Guarded Produce", price=2.0, quantity=10.0)
-    response = client.post(
-        "/api/transactions",
-        json={"product_id": product_id, "quantity": 1.0},
-    )
-    assert response.status_code == 401
-
-
-def test_order_reads_require_authentication(client):
-    assert client.get("/api/orders").status_code == 401
-    assert client.get("/api/transactions").status_code == 401
-
-
 def test_missing_product_rejected(client):
     response = client.post(
         "/api/transactions",
-        headers=_hdr(_buyer_token(client)),
         json={"product_id": 999999, "quantity": 1.0},
     )
     assert response.status_code == 404
@@ -162,12 +147,10 @@ def test_list_transactions_filter(client):
     product_id = _create_product(client, name="Bananas", price=0.5, quantity=20.0)
     client.post(
         "/api/transactions",
-        headers=_hdr(_buyer_token(client)),
         json={"product_id": product_id, "quantity": 2.0, "buyer_name": "Dana"},
     )
     response = client.get(
         "/api/transactions",
-        headers=_hdr(_buyer_token(client)),
         query_string={"product_id": product_id},
     )
     assert response.status_code == 200
@@ -175,17 +158,17 @@ def test_list_transactions_filter(client):
     assert all(txn["product_id"] == product_id for txn in data)
 
 
-def test_buyer_order_reads_are_self_scoped(client):
-    product_id = _create_product(client, name="Private Orders", price=1.0, quantity=20.0)
+def test_order_reads_attribute_demo_buyer(client):
+    product_id = _create_product(client, name="Demo Buyer Orders", price=1.0, quantity=20.0)
     client.post(
         "/api/transactions",
-        headers=_hdr(_buyer_token(client)),
         json={"product_id": product_id, "quantity": 2.0},
     )
-    response = client.get("/api/orders", headers=_hdr(_buyer_token(client)))
+    response = client.get("/api/orders")
     assert response.status_code == 200
-    assert response.get_json()["data"]
-    assert all(row["buyer_id"] > 0 for row in response.get_json()["data"])
+    data = response.get_json()["data"]
+    assert data
+    assert all(row["buyer_username"] == "priya_sharma" for row in data)
 
 
 # --- Reviews -----------------------------------------------------------------------
@@ -204,6 +187,17 @@ def test_create_review(client):
     assert review["sentiment_label"] == "positive"
     assert review["sentiment_score"] > 0
     assert review["rating"] == 5
+
+
+def test_review_uses_explicit_user_id(client):
+    product_id = _create_product(client, name="Attributed Review", price=5.5, quantity=40.0)
+    response = client.post(
+        f"/api/products/{product_id}/reviews",
+        json={"rating": 5, "comment": "Nice", "user_id": 999999},
+    )
+    assert response.status_code == 201
+    # Unknown user_id falls back to the demo buyer.
+    assert response.get_json()["data"]["user_id"] > 0
 
 
 def test_list_reviews(client):
@@ -261,7 +255,6 @@ def test_analytics(client):
     product_id = _create_product(client, name="Mangoes", price=3.2, quantity=80.0)
     client.post(
         "/api/transactions",
-        headers=_hdr(_buyer_token(client)),
         json={"product_id": product_id, "quantity": 5.0, "buyer_name": "Grace"},
     )
     client.post(
@@ -295,7 +288,6 @@ def test_recommendations_user_endpoint_enriched(client):
     )
     second = client.post(
         "/api/products",
-        headers=_hdr(_seller_token(client)),
         json={
             "name": "Green Bananas", "category": "fruits", "price": 1.1,
             "quantity": 25.0,
@@ -304,11 +296,10 @@ def test_recommendations_user_endpoint_enriched(client):
     assert second.status_code == 201
     client.post(
         "/api/transactions",
-        headers=_hdr(_buyer_token(client)),
         json={"product_id": product_id, "quantity": 2.0, "buyer_name": "Ishan"},
     )
     buyer_id = client.get(
-        "/api/transactions", headers=_hdr(_buyer_token(client))
+        "/api/transactions"
     ).get_json()["data"][0]["buyer_id"]
 
     response = client.get(f"/api/recommendations/{buyer_id}", query_string={"top_n": 5})
@@ -321,17 +312,16 @@ def test_recommendations_user_endpoint_enriched(client):
 
 
 def test_product_same_seller_reuses_account(client):
-    """Two products created under the same authenticated seller share its id."""
-    h = _hdr(_seller_token(client))
+    """Two products created under the demo seller share its id."""
     payload = {
         "name": "Red Onions", "category": "vegetables", "price": 1.5,
         "quantity": 40.0,
     }
-    first = client.post("/api/products", headers=h, json=payload)
+    first = client.post("/api/products", json=payload)
     assert first.status_code == 201
     first_seller = first.get_json()["data"]["seller"]["id"]
     second = client.post(
-        "/api/products", headers=h, json={**payload, "name": "White Onions"}
+        "/api/products", json={**payload, "name": "White Onions"}
     )
     assert second.status_code == 201
     second_seller = second.get_json()["data"]["seller"]["id"]
@@ -339,7 +329,7 @@ def test_product_same_seller_reuses_account(client):
 
 
 def test_send_message_endpoint(client):
-    """REST chat endpoint persists via NLP and returns badges (auth-bound)."""
+    """REST chat endpoint persists via NLP and returns badges."""
     product_id = _create_product(client, name="Carrots", price=1.2, quantity=30.0)
     client.post(
         "/api/transactions",
@@ -347,13 +337,11 @@ def test_send_message_endpoint(client):
     )
     stream = client.post(
         "/api/streams",
-        headers=_hdr(_seller_token(client)),
         json={"stream_title": "Morning Harvest"},
     ).get_json()["data"]
 
     response = client.post(
         "/api/streams/send_message",
-        headers=_hdr(_buyer_token(client)),
         json={"stream_id": stream["id"], "message_text": "How much per kg?"},
     )
     assert response.status_code == 201
@@ -361,52 +349,47 @@ def test_send_message_endpoint(client):
     assert data["intent_tag"] == "PRICE_INQUIRY"
     assert "sentiment_badge" in data and "intent_badge" in data
 
+    # Default messages come from the demo buyer — never the host.
+    assert data["is_host"] is False
+
+    # Host-tagged messages are attributed to the stream's seller.
+    as_host = client.post(
+        "/api/streams/send_message",
+        json={
+            "stream_id": stream["id"],
+            "message_text": "Welcome everyone",
+            "is_host": True,
+        },
+    )
+    assert as_host.status_code == 201
+    assert as_host.get_json()["data"]["is_host"] is True
+    assert as_host.get_json()["data"]["username"] == "ramesh_organic_farms"
+
     listing = client.get(f"/api/streams/{stream['id']}/messages")
-    assert len(listing.get_json()["data"]) == 1
+    assert len(listing.get_json()["data"]) == 2
 
 
-# --- Ownership / role checks --------------------------------------------------------
-def test_unauthorized_requests_rejected(client):
-    assert client.post(
-        "/api/products", json={"name": "No Token", "price": 1}
-    ).status_code == 401
-    assert client.get("/api/analytics").status_code == 401
+# --- Seller + directory endpoints (now public under demo identities) -----------
+def test_seller_self_endpoints(client):
+    assert client.get("/api/analytics").status_code == 200
+    assert client.get("/api/seller").status_code == 200
+    assert client.get("/api/seller/orders").status_code == 200
+    assert client.get("/api/seller/inventory").status_code == 200
 
 
-def test_wrong_role_rejected(client):
-    assert client.get(
-        "/api/analytics", headers=_hdr(_buyer_token(client))
-    ).status_code == 403
+def test_user_directory_is_public(client):
+    """Demo mode: the user directory (emails included) is served openly."""
+    response = client.get("/api/users")
+    assert response.status_code == 200
+    usernames = [u["username"] for u in response.get_json()["data"]]
+    assert "priya_sharma" in usernames
 
 
-def test_cross_account_ownership_forbidden(client):
-    """A second seller must not read/end the first seller's resources."""
-    t1 = _register(client, "sel_owner", "seller")
-    t2 = _register(client, "sel_intruder", "seller")
-    stream = client.post(
-        "/api/streams", headers=_hdr(t1), json={"stream_title": "Owner Stream"}
-    ).get_json()["data"]
-    sid = stream["id"]
-    assert client.post(
-        f"/api/streams/{sid}/end", headers=_hdr(t2)
-    ).status_code == 403
-    assert client.get(f"/api/analytics/{stream['seller']['id']}", headers=_hdr(t2)).status_code == 403
-    assert client.get(f"/api/seller/{stream['seller']['id']}/orders", headers=_hdr(t2)).status_code == 403
-    assert client.get(f"/api/seller/{stream['seller']['id']}/inventory", headers=_hdr(t2)).status_code == 403
-
-
-def test_auth_session_logout_and_expiry(client):
-    token = _register(client, "sess_user", "buyer")
-    h = _hdr(token)
-    assert client.get("/api/auth/me", headers=h).status_code == 200
-    assert client.post("/api/auth/logout", headers=h).status_code == 200
-    assert client.get("/api/auth/me", headers=h).status_code == 401
-    assert client.post(
-        "/api/auth/login", json={"identifier": "sess_user", "password": "password123"}
-    ).status_code == 200
-    assert client.post(
-        "/api/auth/login", json={"identifier": "sess_user", "password": "nope"}
-    ).status_code == 401
+def test_seller_endpoints_public(client):
+    response = client.get("/api/seller/1/orders")
+    assert response.status_code == 200
+    response = client.get("/api/seller/1/inventory")
+    assert response.status_code == 200
 
 
 # --- Helpers -----------------------------------------------------------------------
@@ -420,7 +403,6 @@ def _create_product(
 ) -> int:
     response = client.post(
         "/api/products",
-        headers=_hdr(_seller_token(client)),
         json={
             "name": name,
             "category": category,

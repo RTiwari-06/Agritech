@@ -5,7 +5,8 @@ fed by real "Marketwise Price & Arrival" PDF/CSV reports.
 Sellers may upload new reports (PDF or CSV) which the backend parses,
 normalizes (Rs/quintal → Rs/kg) and de-duplicates on
 (commodity, market, market_date).  Unparseable rows are never dropped
-silently — they surface in the ingest report.
+silently — they surface in the ingest report. Everything runs as the demo
+seller identity (the auth layer has been removed).
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from app_pages.api_helpers import (
     _api_get,
     _api_post,
     _api_upload,
-    current_user,
+    current_seller,
     material_symbol,
 )
 
@@ -192,8 +193,8 @@ def app() -> None:
     st.title(f"{material_symbol('monitoring')}  Market Prices & Arrival")
     st.caption('Agmarknet "Marketwise Price & Arrival" feeds — normalized to ₹/kg.')
 
-    user = current_user()
-    if user and user.get("role") == "seller":
+    user = current_seller()
+    if user:
         st.toggle(
             "Seller tools: upload reports & view ingest status",
             key="market_seller_tools",

@@ -9,14 +9,7 @@ API and frontend continue to work with the same shapes as before.
 from flask import Blueprint, request
 import pymongo
 
-from database.db import (
-    authenticate_user,
-    create_login_session,
-    hash_password,
-    resolve_session,
-    revoke_session,
-    session_scope,
-)
+from database.db import session_scope
 from database.models import (
     IntentTag,
     OrderStatus,
@@ -109,123 +102,21 @@ def _payload():
 
 
 # ---------------------------------------------------------------------------
-# Authentication & authorization
+# Demo identities (auth layer removed)
 # ---------------------------------------------------------------------------
 
-def _auth_token() -> str | None:
-    header = request.headers.get("Authorization", "")
-    if header.startswith("Bearer "):
-        return header[7:].strip()
-    return None
+def _demo_seller(session) -> dict | None:
+    """First seeded seller — stands in for every seller-side request."""
+    return session["users"].find_one(
+        {"role": UserRole.SELLER.value}, sort=[("_id", 1)]
+    )
 
 
-def current_user():
-    """Resolve the authenticated user from the bearer token, or None."""
-    from database.db import resolve_session
-    token = _auth_token()
-    if not token:
-        return None
-    with session_scope() as s:
-        user = resolve_session(s, token)
-        if user:
-            user["_token"] = token
-        return user
-
-
-def require_auth(role: str | None = None):
-    """Guard: 401 without a valid token, 403 on wrong role/ownership.
-
-    Returns the authenticated user dict (with ``_token``) or an error
-    response.  Use as::
-
-        @api_bp.get("/api/account")
-        @require_auth("buyer")
-        def account(user): ...
-    """
-    def decorator(fn):
-        from functools import wraps
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            user = current_user()
-            if user is None:
-                return _err("authentication required", 401)
-            if role and user.get("role") != role:
-                return _err(f"{role} role required", 403)
-            return fn(user, *args, **kwargs)
-        return wrapper
-    return decorator
-
-
-@api_bp.post("/api/auth/register")
-def register():
-    from database.db import hash_password
-    payload = _payload()
-    username = (payload.get("username") or "").strip()
-    email = (payload.get("email") or "").strip().lower()
-    password = payload.get("password") or ""
-    role = (payload.get("role") or "buyer").strip().lower()
-    location = (payload.get("location") or "").strip()
-
-    if not username or not email or not password:
-        return _err("username, email, and password are required")
-    if role not in ("buyer", "seller"):
-        return _err("role must be 'buyer' or 'seller'")
-    if len(password) < 8:
-        return _err("password must be at least 8 characters")
-
-    with session_scope() as s:
-        if s["users"].find_one({"$or": [{"email": email}, {"username": username}]}):
-            return _err("email or username already registered", 409)
-        try:
-            password_hash = hash_password(password)
-        except ValueError as exc:
-            return _err(str(exc))
-        doc = make_user_doc(
-            username=username,
-            email=email,
-            role=role,
-            location=location,
-            password_hash=password_hash,
-        )
-        doc["_id"] = _next_id(s.db)
-        s["users"].insert_one(doc)
-        token = create_login_session(s, doc["_id"])
-        return _ok({"token": token, "user": user_to_dict(doc)}, 201)
-
-
-@api_bp.post("/api/auth/login")
-def login():
-    payload = _payload()
-    identifier = (payload.get("identifier") or payload.get("username") or "").strip()
-    password = payload.get("password") or ""
-
-    if not identifier or not password:
-        return _err("identifier and password are required", 400)
-
-    with session_scope() as s:
-        user = authenticate_user(s, identifier, password)
-        if user is None:
-            return _err("invalid credentials", 401)
-        token = create_login_session(s, user["_id"])
-        return _ok({"token": token, "user": user_to_dict(user)})
-
-
-@api_bp.post("/api/auth/logout")
-def logout():
-    from database.db import revoke_session
-    token = _auth_token()
-    if token:
-        with session_scope() as s:
-            revoke_session(s, token)
-    return _ok({"logged_out": True})
-
-
-@api_bp.get("/api/auth/me")
-def me():
-    user = current_user()
-    if user is None:
-        return _err("authentication required", 401)
-    return _ok({"user": user_to_dict(user)})
+def _demo_buyer(session) -> dict | None:
+    """First seeded buyer — stands in for buyer-side requests."""
+    return session["users"].find_one(
+        {"role": UserRole.BUYER.value}, sort=[("_id", 1)]
+    )
 
 
 def _serialize_product(session, product, include_dynamic_price=True, live_engagement=None):
@@ -375,40 +266,6 @@ def _resolve_seller(
             )
             seller = _upsert_user_doc(session, seller)
             return seller
-
-    return None
-
-
-def _resolve_buyer(
-    session,
-    buyer_id: int | None = None,
-    buyer_name: str | None = None,
-    buyer_phone: str | None = None,
-):
-    """Resolve a buyer from buyer_id or buyer_name.
-
-    Creates the buyer if buyer_name is provided and no matching user exists.
-    Returns the buyer document, or None.
-    """
-    if buyer_id:
-        buyer = session["users"].find_one({"_id": buyer_id})
-        if buyer and buyer.get("role") == UserRole.BUYER.value:
-            return buyer
-        return None
-
-    if buyer_name:
-        buyer = session["users"].find_one({"username": buyer_name.strip()[:80]})
-        if buyer:
-            return buyer
-        email = buyer_phone or f"{buyer_name.lower().replace(' ', '_')}@example.com"
-        buyer = make_user_doc(
-            username=buyer_name.strip()[:80],
-            email=email,
-            role=UserRole.BUYER.value,
-            location="",
-        )
-        buyer = _upsert_user_doc(session, buyer)
-        return buyer
 
     return None
 
@@ -566,8 +423,7 @@ def get_product(product_id):
 
 
 @api_bp.post("/api/products")
-@require_auth("seller")
-def create_product(user):
+def create_product():
     payload = _payload()
     name = (payload.get("name") or "").strip()
     if not name:
@@ -586,7 +442,9 @@ def create_product(user):
         category = ProductCategory.VEGETABLE.value
 
     with session_scope() as s:
-        seller = user
+        seller = _demo_seller(s)
+        if seller is None:
+            return _err("no seller in database — run the seed script first", 503)
         doc = make_product_doc(
             seller_id=seller["_id"],
             name=name,
@@ -616,12 +474,7 @@ def create_product(user):
 # ---------------------------------------------------------------------------
 
 @api_bp.post("/api/orders")
-@require_auth("buyer")
-def create_order(user=None):
-    if user is None:
-        from database.db import current_user as _cu
-        user = _cu()
-    buyer = user
+def create_order():
     payload = _payload()
     product_id = payload.get("product_id")
 
@@ -633,10 +486,10 @@ def create_order(user=None):
     if quantity_kg <= 0:
         return _err("quantity must be positive")
 
-    buyer_name = payload.get("buyer_name")
-    buyer_phone = payload.get("buyer_phone")
-
     with session_scope() as s:
+        buyer = _demo_buyer(s)
+        if buyer is None:
+            return _err("no buyer in database — run the seed script first", 503)
 
         product = s["products"].find_one({"_id": product_id})
         if product is None:
@@ -699,24 +552,21 @@ def create_order(user=None):
 
 
 @api_bp.post("/api/transactions")
-@require_auth("buyer")
-def create_transaction(user):
+def create_transaction():
     return create_order()
 
 
 @api_bp.get("/api/transactions")
-@require_auth()
-def list_transactions(user):
-    return _list_orders_for_user(user)
+def list_transactions():
+    return _list_orders()
 
 
 @api_bp.get("/api/orders")
-@require_auth()
-def list_orders(user):
-    return _list_orders_for_user(user)
+def list_orders():
+    return _list_orders()
 
 
-def _list_orders_for_user(user):
+def _list_orders():
     try:
         buyer_id = int(request.args.get("buyer_id", 0) or 0)
     except (TypeError, ValueError):
@@ -729,23 +579,10 @@ def _list_orders_for_user(user):
 
     with session_scope() as s:
         query: dict = {}
-        if user.get("role") == UserRole.BUYER.value:
-            if buyer_id and buyer_id != user["_id"]:
-                return _err("forbidden", 403)
-            query["buyer_id"] = user["_id"]
-        elif user.get("role") == UserRole.SELLER.value:
-            seller_product_ids = [
-                p["_id"] for p in s["products"].find(
-                    {"seller_id": user["_id"]}, {"_id": 1}
-                )
-            ]
-            if product_id and product_id not in seller_product_ids:
-                return _err("forbidden", 403)
-            query["product_id"] = (
-                product_id if product_id else {"$in": seller_product_ids}
-            )
-        else:
-            return _err("forbidden", 403)
+        if buyer_id:
+            query["buyer_id"] = buyer_id
+        if product_id:
+            query["product_id"] = product_id
         if status:
             try:
                 status_enum = OrderStatus(status)
@@ -807,16 +644,18 @@ def get_stream(stream_id):
 
 
 @api_bp.post("/api/streams")
-@require_auth("seller")
-def create_stream(user):
+def create_stream():
     payload = _payload()
-    seller_id = user["_id"]
     title = (payload.get("stream_title") or "").strip()
 
     if not title:
         return _err("stream_title is required")
 
     with session_scope() as s:
+        seller = _demo_seller(s)
+        if seller is None:
+            return _err("no seller in database — run the seed script first", 503)
+        seller_id = seller["_id"]
         doc = make_live_stream_doc(
             seller_id=seller_id,
             stream_title=title[:200],
@@ -838,14 +677,11 @@ def create_stream(user):
 
 
 @api_bp.post("/api/streams/<int:stream_id>/end")
-@require_auth("seller")
-def end_stream(user, stream_id):
+def end_stream(stream_id):
     with session_scope() as s:
         stream = s["live_streams"].find_one({"_id": stream_id})
         if stream is None:
             return _err("stream not found", 404)
-        if stream.get("seller_id") != user["_id"]:
-            return _err("not your stream", 403)
         s["live_streams"].update_one({"_id": stream_id}, {"$set": {"is_active": False}})
         stream["is_active"] = False
         return _ok(stream_to_dict(stream))
@@ -878,21 +714,35 @@ def get_chat_messages(stream_id):
 
 
 @api_bp.post("/api/streams/send_message")
-@require_auth()
-def send_stream_message(user):
+def send_stream_message():
     """REST alternative to the SocketIO ``send_message`` event."""
     payload = _payload()
     stream_id = payload.get("stream_id")
-    user_id = user["_id"]
     message_text = (payload.get("message_text") or "").strip()
-    is_host = bool(payload.get("is_host", False))
 
     if not stream_id or not message_text:
         return _err("stream_id and message_text required")
 
-    message_data = build_stream_message_data(
-        stream_id, user_id, message_text, is_host=is_host
-    )
+    # Demo identity (auth removed): host messages come from the stream's
+    # seller; an explicit valid ``user_id`` is honoured; otherwise the first
+    # seeded buyer sends the message.
+    with session_scope() as s:
+        stream = s["live_streams"].find_one({"_id": stream_id})
+        if stream is None:
+            return _err("invalid stream", 404)
+        sender = None
+        if payload.get("is_host"):
+            sender = s["users"].find_one({"_id": stream.get("seller_id")})
+        if sender is None and payload.get("user_id"):
+            candidate = s["users"].find_one({"_id": payload.get("user_id")})
+            if candidate:
+                sender = candidate
+        if sender is None:
+            sender = _demo_buyer(s)
+    if sender is None:
+        return _err("no users in database — run the seed script first", 503)
+
+    message_data = build_stream_message_data(stream_id, sender["_id"], message_text)
     if message_data is None:
         return _err("invalid stream or user", 404)
 
@@ -922,8 +772,6 @@ def list_reviews(product_id):
 @api_bp.post("/api/products/<int:product_id>/reviews")
 def create_review(product_id):
     payload = _payload()
-    user_id = payload.get("user_id")
-    buyer_name = payload.get("buyer_name")
     review_text = (payload.get("review_text", payload.get("comment", "")) or "").strip()
 
     try:
@@ -939,15 +787,23 @@ def create_review(product_id):
         if product is None:
             return _err("product not found", 404)
 
-        user = _resolve_buyer(s, buyer_id=user_id, buyer_name=buyer_name)
-        if user is None:
-            return _err("user_id or buyer_name required", 404)
+        # Demo identity (auth removed): honour an explicit ``user_id`` when it
+        # exists, otherwise the review is attributed to the first seeded buyer.
+        reviewer = None
+        if payload.get("user_id"):
+            candidate = s["users"].find_one({"_id": payload.get("user_id")})
+            if candidate:
+                reviewer = candidate
+        if reviewer is None:
+            reviewer = _demo_buyer(s)
+        if reviewer is None:
+            return _err("no users in database — run the seed script first", 503)
 
         sentiment = _nlp_engine.analyze_sentiment(review_text)
 
         review_doc = make_review_doc(
             product_id=product["_id"],
-            user_id=user["_id"],
+            user_id=reviewer["_id"],
             review_text=review_text,
             rating=rating,
             sentiment_score=sentiment["sentiment_score"],
@@ -968,7 +824,7 @@ def create_review(product_id):
         result = review_to_dict(
             review_doc,
             product_name=product.get("name", ""),
-            username=user.get("username", ""),
+            username=reviewer.get("username", ""),
         )
         return _ok(result, 201)
 
@@ -1077,16 +933,17 @@ def get_recommendations_legacy():
 # ---------------------------------------------------------------------------
 
 @api_bp.get("/api/analytics")
-@require_auth("seller")
-def self_analytics(user):
-    return _analytics_for(user["_id"])
+def self_analytics():
+    """Analytics for the first seeded seller (demo identity)."""
+    with session_scope() as s:
+        seller = _demo_seller(s)
+        if seller is None:
+            return _err("no seller in database — run the seed script first", 503)
+        return _analytics_for(seller["_id"])
 
 
 @api_bp.get("/api/analytics/<int:seller_id>")
-@require_auth("seller")
-def get_seller_analytics(user, seller_id):
-    if seller_id != user["_id"]:
-        return _err("not your analytics", 403)
+def get_seller_analytics(seller_id):
     return _analytics_for(seller_id)
 
 
@@ -1405,18 +1262,17 @@ def list_users():
 # ---------------------------------------------------------------------------
 
 @api_bp.get("/api/seller")
-@require_auth("seller")
-def self_seller(user):
+def self_seller():
+    """Seller profile for the first seeded seller (demo identity)."""
     with session_scope() as s:
-        seller = _lookup_seller(s, user["_id"])
+        seller = _demo_seller(s)
         if seller is None:
             return _err("seller not found", 404)
         return _ok({"seller": user_to_dict(seller)})
 
 
 @api_bp.get("/api/seller/<int:seller_id>")
-@require_auth()
-def get_seller(user, seller_id):
+def get_seller(seller_id):
     with session_scope() as s:
         seller = _lookup_seller(s, seller_id)
         if seller is None:
@@ -1425,17 +1281,17 @@ def get_seller(user, seller_id):
 
 
 @api_bp.get("/api/seller/orders")
-@require_auth("seller")
-def self_seller_orders(user):
-    return _seller_orders(user["_id"])
+def self_seller_orders():
+    with session_scope() as s:
+        seller = _demo_seller(s)
+        if seller is None:
+            return _err("seller not found or not a seller", 404)
+        return _seller_orders(seller["_id"])
 
 
 @api_bp.get("/api/seller/<int:seller_id>/orders")
-@require_auth("seller")
-def get_seller_orders(user, seller_id):
+def get_seller_orders(seller_id):
     """Orders for a seller's products — powers the seller-studio orders tab."""
-    if seller_id != user["_id"]:
-        return _err("not your orders", 403)
     return _seller_orders(seller_id)
 
 
@@ -1482,16 +1338,16 @@ def _seller_orders(seller_id: int):
 
 
 @api_bp.get("/api/seller/inventory")
-@require_auth("seller")
-def self_seller_inventory(user):
-    return _seller_inventory(user["_id"])
+def self_seller_inventory():
+    with session_scope() as s:
+        seller = _demo_seller(s)
+        if seller is None:
+            return _err("seller not found or not a seller", 404)
+        return _seller_inventory(seller["_id"])
 
 
 @api_bp.get("/api/seller/<int:seller_id>/inventory")
-@require_auth("seller")
-def get_seller_inventory(user, seller_id):
-    if seller_id != user["_id"]:
-        return _err("not your inventory", 403)
+def get_seller_inventory(seller_id):
     return _seller_inventory(seller_id)
 
 
@@ -1558,8 +1414,7 @@ def _seller_inventory(seller_id: int):
 # ---------------------------------------------------------------------------
 
 @api_bp.post("/api/market/ingest")
-@require_auth("seller")
-def market_ingest(user):
+def market_ingest():
     """Upload a Marketwise Price & Arrival PDF (or CSV) and ingest it."""
     from market_data import ingest_records, parse_file
 
@@ -1594,8 +1449,11 @@ def market_ingest(user):
         from market_data.parser import ParseResult
         parsed = parse_csv(io.BytesIO(raw), source=filename)
 
+    with session_scope() as s:
+        seller = _demo_seller(s)
+    actor = seller.get("username") if seller else "unknown"
     ingested = ingest_records(parsed.records, source=filename,
-                              ingest_context=f"uploaded by user {user['username']}")
+                              ingest_context=f"uploaded by {actor}")
     return _ok({
         "parsed": {
             "records": len(parsed.records),
@@ -1646,8 +1504,7 @@ def market_series():
 
 
 @api_bp.get("/api/market/status")
-@require_auth("seller")
-def market_status(user):
+def market_status():
     from market_data import ingest_status, recent_ingest_log
     return _ok({
         "stats": ingest_status(),
@@ -1656,8 +1513,7 @@ def market_status(user):
 
 
 @api_bp.get("/api/market/ingest_log")
-@require_auth("seller")
-def market_ingest_log(user):
+def market_ingest_log():
     from market_data import recent_ingest_log
     return _ok(recent_ingest_log(limit=50))
 

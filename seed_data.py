@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 
 from config import Config
-from database.db import drop_all, init_db, get_db, get_client, hash_password
+from database.db import drop_all, init_db, get_db, get_client, _next_id
 from database.models import (
     SentimentLabel,
     IntentTag,
@@ -281,9 +281,13 @@ def reset_and_seed() -> None:
     db = get_db()
 
     # mongomock can lose the auto-seeded counter doc across drop+create.
-    # Reset it cleanly so _next_id() starts from 1.
-    db["_counters"].delete_many({})
-    db["_counters"].insert_one({"_id": "next_id", "seq": 0})
+    # Reset it cleanly so _next_id() starts from 1.  Idempotent upsert (never a
+    # bare insert) so concurrent writers can't collide on the counter doc.
+    db["_counters"].update_one(
+        {"_id": "next_id"},
+        {"$set": {"seq": 0}},
+        upsert=True,
+    )
 
     # Create sellers
     sellers = []
@@ -293,7 +297,6 @@ def reset_and_seed() -> None:
             email=entry["email"],
             role=entry["role"],
             location=entry["location"],
-            password_hash=hash_password("demo-password-123"),
         )
         doc["_id"] = _next_id(db)
         doc.setdefault("created_at", _offset(hours=2).isoformat())
@@ -308,7 +311,6 @@ def reset_and_seed() -> None:
             email=entry["email"],
             role=entry["role"],
             location=entry["location"],
-            password_hash=hash_password("demo-password-123"),
         )
         doc["_id"] = _next_id(db)
         doc.setdefault("created_at", _offset(hours=2).isoformat())
@@ -430,18 +432,6 @@ def reset_and_seed() -> None:
     print(f"  Orders: {len(SAMPLE_ORDERS)}")
     repo = "mongomock" if "mongomock" in repr(get_client()) else "mongodb"
     print(f"Database: {Config.MONGO_DB} (MongoDB via {repo})")
-
-
-def _next_id(db):
-    from pymongo import ReturnDocument
-    counters = db["_counters"]
-    doc = counters.find_one_and_update(
-        {"_id": "next_id"},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    return int(doc["seq"])
 
 
 if __name__ == "__main__":

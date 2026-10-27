@@ -157,9 +157,15 @@ class AgriNLPEngine:
     def _get_transformer_sentiment(self):
         """Lazily load transformer sentiment pipeline.
 
-        Retries on every call so transient failures don't permanently disable
-        the transformer layer for the process lifetime.
+        Gated by ``Config.USE_TRANSFORMER_SENTIMENT`` (default off) — the
+        VADER/lexicon path is fast enough for every runtime call, and running
+        a model per seed message made first-boot seeding take minutes.
+        Returns ``None`` (keyword fallback) while the flag is off; retries on
+        every call so enabling the flag doesn't permanently disable the
+        transformer layer for the process lifetime.
         """
+        if not Config.USE_TRANSFORMER_SENTIMENT:
+            return None
         pipeline_fn = _ensure_transformers()
         if pipeline_fn is not None:
             if self._transformer_sentiment is None:
@@ -180,9 +186,15 @@ class AgriNLPEngine:
     def _get_transformer_intent(self):
         """Lazily load transformer zero-shot classification for intent.
 
-        Retries on every call so transient failures don't permanently disable
-        the transformer layer for the process lifetime.
+        Gated by ``Config.USE_TRANSFORMER_INTENT`` (default off): the
+        zero-shot pipeline (bart-large-mnli) is far too slow on CPU for the
+        per-message calls made during seeding and chat, so the keyword
+        matcher is the default and transformers remain opt-in.  Retries on
+        every call so transient failures don't permanently disable the
+        transformer layer for the process lifetime.
         """
+        if not Config.USE_TRANSFORMER_INTENT:
+            return None
         pipeline_fn = _ensure_transformers()
         if pipeline_fn is not None:
             if self._transformer_intent is None:

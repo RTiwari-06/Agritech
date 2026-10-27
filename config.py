@@ -50,8 +50,14 @@ class Config:
     INTENT_MODEL: str = os.getenv(
         "INTENT_MODEL", "facebook/bart-large-mnli"
     )
+    # Use the transformers sentiment pipeline instead of the built-in lexicon scorer.
     USE_TRANSFORMER_SENTIMENT: bool = _as_bool(
         os.getenv("USE_TRANSFORMER_SENTIMENT", ""), default=False
+    )
+    # Use a transformer zero-shot classifier for intent detection; the
+    # keyword-matching fallback is used otherwise (much faster on CPU).
+    USE_TRANSFORMER_INTENT: bool = _as_bool(
+        os.getenv("USE_TRANSFORMER_INTENT", ""), default=False
     )
     AUTO_DOWNLOAD_NLP_MODEL: bool = _as_bool(
         os.getenv("AUTO_DOWNLOAD_NLP_MODEL", ""), default=True

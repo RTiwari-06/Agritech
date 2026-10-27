@@ -21,13 +21,16 @@ _nlp_engine = get_nlp_engine()
 STREAM_ROOM_PREFIX = "stream_"
 
 
-def build_stream_message_data(stream_id, user_id, message_text, is_host=False):
+def build_stream_message_data(stream_id, user_id, message_text):
     """Analyze, persist, and enrich a stream chat message.
 
     Shares a single NLP + persistence code path between the SocketIO
     ``send_message`` handler and the REST ``/api/streams/send_message``
     endpoint.  Returns the row dict with sentiment/intent badges, or
     ``None`` when the stream or user is invalid.
+
+    ``is_host`` is derived server-side (stream owner + sender role) so no
+    client can claim the host badge for itself.
     """
     sentiment = _nlp_engine.analyze_sentiment(message_text)
     intent = _nlp_engine.detect_intent(message_text)
@@ -39,6 +42,11 @@ def build_stream_message_data(stream_id, user_id, message_text, is_host=False):
         if not stream or not user:
             return None
 
+        is_host = (
+            user.get("role") == "seller"
+            and stream.get("seller_id") == user.get("_id")
+        )
+
         message_doc = make_chat_message_doc(
             stream_id=stream_id,
             user_id=user_id,
@@ -46,7 +54,7 @@ def build_stream_message_data(stream_id, user_id, message_text, is_host=False):
             sentiment_score=sentiment["sentiment_score"],
             sentiment_label=SentimentLabel(sentiment["sentiment_label"]).value,
             intent_tag=IntentTag(intent).value,
-            is_host=bool(is_host),
+            is_host=is_host,
         )
         message_doc["_id"] = _next_id(s.db)
         message_doc.setdefault("created_at", _now_iso())
@@ -76,11 +84,9 @@ def build_stream_message_data(stream_id, user_id, message_text, is_host=False):
 def register_socketio_handlers(socketio) -> None:
     @socketio.on("connect")
     def handle_connect(auth=None):
+        # Auth layer removed: every socket may connect and post. Senders are
+        # attributed to their stated user (or the demo buyer) at message time.
         emit("connected", {"message": "Connected to Agritech Marketplace"})
-
-    @socketio.on("disconnect")
-    def handle_disconnect():
-        pass
 
     @socketio.on("join_stream")
     def handle_join_stream(data):
@@ -128,16 +134,30 @@ def register_socketio_handlers(socketio) -> None:
     @socketio.on("send_message")
     def handle_send_message(data):
         """Receive chat text from buyer -> process through NLP -> store -> broadcast."""
-        stream_id = (data or {}).get("stream_id")
-        user_id = (data or {}).get("user_id")
-        message_text = (data or {}).get("message_text", "").strip()
-        is_host = bool((data or {}).get("is_host", False))
+        data = data or {}
+        stream_id = data.get("stream_id")
+        message_text = (data.get("message_text") or "").strip()
 
-        if not stream_id or not user_id or not message_text:
-            emit("error", {"message": "stream_id, user_id, and message_text required"})
+        if not stream_id or not message_text:
+            emit("error", {"message": "stream_id and message_text required"})
             return
 
-        message_data = build_stream_message_data(stream_id, user_id, message_text, is_host=is_host)
+        # Demo identity (auth removed): honour a stated ``user_id`` when it
+        # exists, otherwise attribute the message to the first seeded buyer.
+        with session_scope() as s:
+            sender_id = data.get("user_id")
+            if sender_id and s["users"].find_one({"_id": sender_id}) is None:
+                sender_id = None
+            if not sender_id:
+                buyer = s["users"].find_one(
+                    {"role": "buyer"}, sort=[("_id", 1)]
+                )
+                sender_id = buyer["_id"] if buyer else None
+        if sender_id is None:
+            emit("error", {"message": "No users in database — run the seed script first"})
+            return
+
+        message_data = build_stream_message_data(stream_id, sender_id, message_text)
         if message_data is None:
             emit("error", {"message": "Invalid stream or user"})
             return

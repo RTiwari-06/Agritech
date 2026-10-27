@@ -48,6 +48,7 @@ chartCategoricalColors = [
 
 # Sequential colors for heatmaps/gradients (green ramp)
 chartSequentialColors = [
+    "#051F13",
     "#082F1C",
     "#0B4726",
     "#0F5F31",

@@ -1,12 +1,11 @@
 """Agritech — marketplace + live streams pages.
 
-Buyer-facing: browse products, search, order placement (buyer accounts);
+Buyer-facing: browse products, search, order placement;
 plus a dedicated live-shopping page with per-stream chat that auto-refreshes
 via ``st.fragment(run_every=3)`` so new messages appear without a click.
 
-Everything that mutates state is bound to the authenticated user:
-authorization headers come from ``api_helpers`` and the backend refuses to
-attribute orders/chat to anyone but the token's owner.
+All actions run as the demo buyer/seller identities resolved by
+``app_pages.api_helpers`` (the auth layer has been removed).
 """
 
 from __future__ import annotations
@@ -80,15 +79,14 @@ def app() -> None:
 
     with st.sidebar:
         st.subheader(f"{material_symbol('account_circle')}  Buyer")
-        user = _current_user_id()
-        if user:
-            buyer = _load_seller(user)
+        buyer_id = _current_user_id()
+        if buyer_id:
+            buyer = _load_seller(buyer_id)
             if buyer:
                 st.caption(f"{material_symbol('person')}  {buyer.get('username')}")
                 st.caption(f"{material_symbol('mail')}  {buyer.get('email')}")
-            st.caption(f"{material_symbol('verified')}  Authenticated via bearer token")
         else:
-            st.caption("Sign in as a buyer to place orders.")
+            st.caption("Start the backend and refresh to place orders.")
 
         st.space("small")
         st.text_input(
@@ -171,11 +169,10 @@ def _chat_window(stream_id: int) -> None:
     messages = _load_stream_messages(stream_id)
     _render_chat_messages(messages)
 
-    prompt = st.chat_input("Type a message…")
+    prompt = st.chat_input("Type a message…", key=f"chat_input_{stream_id}")
     if prompt:
-        user_id = _current_user_id()
-        if not user_id:
-            st.toast("Sign in to join the conversation.", icon=material_symbol("warning"))
+        if not _current_user_id():
+            st.toast("Backend unreachable — restart it to chat.", icon=material_symbol("warning"))
         else:
             resp = _api_post("/api/streams/send_message", {
                 "stream_id": stream_id,

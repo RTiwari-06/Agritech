@@ -60,14 +60,12 @@ def make_user_doc(
     email: str,
     role: str = "buyer",
     location: str = "",
-    password_hash: str = "",
 ) -> dict:
     return {
         "username": username[:80],
         "email": email,
         "role": role,
         "location": location[:120],
-        "password_hash": password_hash,
         "created_at": _now_iso(),
     }
 
