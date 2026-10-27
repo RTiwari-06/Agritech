@@ -6,7 +6,18 @@ signal and inventory status.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import sys
+from pathlib import Path
+
+# Page-module bootstrap: when a page is executed directly as the Streamlit
+# script (or imported with only app_pages/ on sys.path), the repo root is
+# absent and `app_pages`/`config` fail with ModuleNotFoundError.  Insert the
+# root the same way frontend/app.py does at entry-point level.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from typing import Any, Dict, List, Optional, cast
 
 import pandas as pd
 import plotly.express as px
@@ -14,12 +25,14 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from app_pages.api_helpers import (
+    BadgeColor,
     MATERIAL_SYMBOLS,
     _api_get,
     _current_seller_id,
     chart_sentiment_pie,
     material_symbol,
 )
+from app_pages.ui import page_header
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +101,10 @@ def _forecast_chart(forecasts: list[dict]) -> Optional[go.Figure]:
         title="Demand forecast per product",
         xaxis_title="",
         yaxis_title="Demand (kg/day)",
-        template="plotly_dark",
+        template="plotly_white",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#E8F1EC"),
+        font=dict(color="#1F352B"),
     )
     return fig
 
@@ -111,13 +124,47 @@ def _revenue_chart(daily_data: list[dict]) -> Optional[go.Figure]:
     )
     fig.update_layout(
         title="Daily revenue (last 7 days)",
-        template="plotly_dark",
+        template="plotly_white",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#E8F1EC"),
+        font=dict(color="#1F352B"),
         coloraxis_showscale=False,
     )
     return fig
+
+
+@st.fragment(run_every=3)
+def _live_market_metrics() -> None:
+    """Render the Redis-backed market metrics independently every 3 seconds."""
+    response = _api_get("/api/analytics", ttl=0)
+    if not response or not response.get("ok"):
+        st.info("Live market analytics are unavailable while the REST API is disconnected.")
+        return
+    data = response.get("data")
+    metrics = data if isinstance(data, dict) else response
+    required = (
+        "total_products",
+        "total_stock_kg",
+        "avg_surge_pct",
+        "low_stock_count",
+    )
+    if any(key not in metrics for key in required):
+        st.warning("The analytics endpoint returned an incomplete metrics payload.")
+        return
+
+    with st.container(horizontal=True):
+        st.metric("Total commodities", int(metrics["total_products"]), border=True)
+        st.metric(
+            "Market liquidity",
+            f"{float(metrics['total_stock_kg']):,.1f} kg",
+            border=True,
+        )
+        st.metric(
+            "Average price surge",
+            f"{float(metrics['avg_surge_pct']):+.2f}%",
+            border=True,
+        )
+        st.metric("Low stock commodities", int(metrics["low_stock_count"]), border=True)
 
 
 # ---------------------------------------------------------------------------
@@ -126,11 +173,22 @@ def _revenue_chart(daily_data: list[dict]) -> Optional[go.Figure]:
 
 def app() -> None:
     """Sales analytics & optimization dashboard page — demo seller identity."""
-    st.title(f"{material_symbol('analytics')} Sales analytics & optimization dashboard")
+    page_header(
+        "Insights",
+        "The story behind your sales.",
+        "A practical view of revenue, demand, sentiment, and stock health.",
+        ":material/analytics:",
+    )
+    st.subheader("Live market performance")
+    _live_market_metrics()
+    st.divider()
 
     seller_id = _current_seller_id()
     if not seller_id:
-        st.warning(f"{material_symbol('warning')}  Backend unreachable — restart it to view analytics.")
+        st.info(
+            "Seller-level orders, reviews, and forecasts are unavailable in the "
+            "Redis market analytics service."
+        )
         return
     st.session_state.analytics_seller_id = seller_id
 
@@ -247,7 +305,11 @@ def app() -> None:
                         f"{rec.get('current_stock_kg', 0):.0f} kg in stock · "
                         f"reorder {rec.get('recommended_reorder_kg', 0):.0f} kg"
                     )
-                    st.badge(priority.upper(), icon=f":material/{icon}:", color=color)
+                    st.badge(
+                        priority.upper(),
+                        icon=f":material/{icon}:",
+                        color=cast(BadgeColor, color),
+                    )
                     st.markdown(line)
             else:
                 st.caption(f"{material_symbol('info')} No restock recommendations yet.")
@@ -336,9 +398,9 @@ def app() -> None:
                 },
             )
         )
-        fig_gauge.update_layout(height=240, template="plotly_dark",
+        fig_gauge.update_layout(height=240, template="plotly_white",
                                paper_bgcolor="rgba(0,0,0,0)",
-                               font=dict(color="#E8F1EC"))
+                               font=dict(color="#1F352B"))
         st.plotly_chart(fig_gauge, theme=None)
 
     sent_icon = {
@@ -346,7 +408,6 @@ def app() -> None:
         "NEUTRAL": "mood",
         "NEGATIVE": "thumb_down",
     }
-    sent_color = {"POSITIVE": "green", "NEUTRAL": "yellow", "NEGATIVE": "red"}
     with st.container(horizontal=True):
         st.metric(f"{material_symbol('schedule')} Total reviews",
                   value=sentiment.get("total_reviews", 0), border=True)
@@ -420,7 +481,11 @@ def app() -> None:
                 for alert in low_stock:
                     product_name = alert.get("product_name", "Unknown Product")
                     stock_kg = alert.get("stock_kg", 0)
-                    st.badge("LOW STOCK", icon=":material/warning:", color="orange")
+                    st.badge(
+                        "LOW STOCK",
+                        icon=":material/warning:",
+                        color=cast(BadgeColor, "orange"),
+                    )
                     st.markdown(
                         f"{material_symbol('warning')} "
                         f"**{product_name}** — only {stock_kg:.1f} kg remaining."

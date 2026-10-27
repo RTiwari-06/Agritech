@@ -28,6 +28,9 @@ if sys.platform == "win32":
 from api.app import create_app
 from config import Config
 from database.db import get_db
+from database.pdf_seeder import default_pdf_path, seed_redis
+from database.redis_db import get_all_products
+from redis.exceptions import RedisError
 from seed_data import reset_and_seed
 
 # Auto-seed on first run if the DB is empty (mongomock = in-process,
@@ -54,6 +57,29 @@ else:
     print(
         f"Using existing data in MongoDB ({_total_users} users)."
     )
+
+try:
+    _redis_products = get_all_products()
+except RedisError as exc:
+    print(
+        "WARNING: Redis at 127.0.0.1:6379 is unavailable; starting Flask "
+        f"without Redis-backed data: {exc}"
+    )
+    _redis_products = []
+    _redis_available = False
+else:
+    _redis_available = True
+
+if _redis_available and not _redis_products:
+    try:
+        _seeded_products = seed_redis([default_pdf_path()], flush_db=False)
+    except RedisError as exc:
+        print(f"WARNING: Could not seed Redis products: {exc}")
+    else:
+        print(f"Seeded {_seeded_products} APMC commodities into Redis.")
+else:
+    if _redis_products:
+        print(f"Using {len(_redis_products)} existing Redis commodities.")
 
 app, socketio = create_app()
 

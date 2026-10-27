@@ -1,309 +1,38 @@
-"""REST endpoints for the marketplace, analytics and optimisation pipelines.
+"""REST endpoints — Phase 1: MongoDB fully purged; products served from Redis.
 
-All database access goes through ``session_scope()`` which yields a
-:class:`MongoSession` whose ``session['collection']`` gives a
-pymongo collection.  Documents use integer ``_id`` values so the REST
-API and frontend continue to work with the same shapes as before.
+The only data sources are ``database.redis_db`` (connection pool, product
+Hashes, capped chat List) and ``optimization.engine dynamic_pricing_engine``
+sentiment/engagement scores are computed from the live chat feed and passed
+into ``DynamicPricingEngine.calculate_optimal_price()`` for every product.
+
+No session_scope, no pymongo, no in-file mock arrays.
 """
 
-from flask import Blueprint, request
-import pymongo
+from datetime import datetime, timezone
+import math
+import uuid
+from typing import Any, Dict, Optional
 
-from database.db import session_scope
-from database.models import (
-    IntentTag,
-    OrderStatus,
-    ProductCategory,
-    SentimentLabel,
-    UserRole,
-    make_user_doc,
-    make_product_doc,
-    make_live_stream_doc,
-    make_chat_message_doc,
-    make_review_doc,
-    make_order_doc,
-    make_price_log_doc,
-    user_to_dict,
-    product_to_dict,
-    stream_to_dict,
-    chat_message_to_dict,
-    review_to_dict,
-    order_to_dict,
-    price_log_to_dict,
+from flask import Blueprint, jsonify, request
+
+from database.redis_db import (
+    create_redis_order,
+    get_all_orders,
+    get_all_products,
+    get_product,
+    get_recent_chats,
+    get_client,
+    push_chat_message,
+    update_product_fields,
 )
 from nlp.nlp_engine import get_nlp_engine
-from nlp.processing import semantic_scores
-from optimization.engine import (
-    DynamicPricingEngine,
-    RecommendationEngine,
-    DemandForecaster,
-)
-from optimization.metrics import (
-    demand_score,
-    rating_summary,
-    revenue_by_day,
-    restock_advice,
-    sales_summary,
-    stream_engagement_score,
-)
-from optimization.recommendation import build_engine_from_products
-from api.socketio_events import STREAM_ROOM_PREFIX, build_stream_message_data
+from optimization.engine import create_pricing_engine
+from redis.exceptions import RedisError
 
 api_bp = Blueprint("api", __name__)
 
-_nlp_engine = get_nlp_engine()
-_pricing_engine = DynamicPricingEngine()
-_recommendation_engine = RecommendationEngine()
-_forecaster = DemandForecaster()
-
-
-def _json_safe(value):
-    """Recursively coerce values to JSON-serializable primitives.
-
-    Legacy rows created before the integer ``_id`` convention can carry a
-    bson ``ObjectId``; without coercion Flask's JSON encoder raises
-    ``TypeError: Object of type ObjectId is not JSON serializable``.
-    """
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(v) for v in value]
-    try:
-        _is_object_id = isinstance(value, pymongo.ObjectId)
-    except AttributeError:
-        _is_object_id = type(value).__name__ == "ObjectId"
-    if _is_object_id:
-        return str(value)
-    if isinstance(value, (bytes, bytearray)):
-        try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return value.hex()
-    from datetime import date, datetime
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    return str(value)
-
-
-def _ok(data, status=200):
-    return {"ok": True, "data": _json_safe(data)}, status
-
-
-def _err(message, status=400):
-    return {"ok": False, "error": _json_safe(message)}, status
-
-
-def _payload():
-    return request.get_json(silent=True) or {}
-
-
-# ---------------------------------------------------------------------------
-# Demo identities (auth layer removed)
-# ---------------------------------------------------------------------------
-
-def _demo_seller(session) -> dict | None:
-    """First seeded seller — stands in for every seller-side request."""
-    return session["users"].find_one(
-        {"role": UserRole.SELLER.value}, sort=[("_id", 1)]
-    )
-
-
-def _demo_buyer(session) -> dict | None:
-    """First seeded buyer — stands in for buyer-side requests."""
-    return session["users"].find_one(
-        {"role": UserRole.BUYER.value}, sort=[("_id", 1)]
-    )
-
-
-def _serialize_product(session, product, include_dynamic_price=True, live_engagement=None):
-    """Serialize a product document with optional dynamic pricing."""
-    data = product_to_dict(product)
-    if include_dynamic_price:
-        # Gather reviews + orders for this product
-        reviews = list(session["reviews"].find({"product_id": product["_id"]}))
-        avg_sentiment = (
-            sum(r.get("sentiment_score", 0.0) for r in reviews) / len(reviews)
-            if reviews
-            else 0.0
-        )
-        orders = list(session["orders"].find({"product_id": product["_id"]}))
-        demand = demand_score(orders)
-
-        calc = _pricing_engine.calculate_optimal_price(
-            product_id=product["_id"],
-            base_price=product.get("price", 0.0),
-            demand_factor=demand,
-            stock_kg=product.get("stock_kg", 0.0),
-            sentiment_score=avg_sentiment,
-            live_engagement=live_engagement,
-        )
-        data["dynamic_price"] = calc.optimal_price
-        data["price_change_pct"] = calc.change_pct
-        data["live_engagement"] = (
-            round(live_engagement, 4) if live_engagement is not None else None
-        )
-        data["live_price_boost_pct"] = round(calc.live_factor * 100, 2)
-    return data
-
-
-def _lookup_seller(session, seller_id: int):
-    """Return seller document, or None."""
-    return session["users"].find_one({"_id": seller_id})
-
-
-def _lookup_product(session, product_id: int):
-    return session["products"].find_one({"_id": product_id})
-
-
-def _lookup_user(session, user_id: int):
-    return session["users"].find_one({"_id": user_id})
-
-
-def _seller_live_engagement(session, seller_id: int) -> float | None:
-    """Chat-driven purchase-intent signal in [0, 1] from the seller's live streams.
-
-    Returns ``None`` when there is no active stream (or no chat yet) so the
-    pricing engine stays neutral instead of penalising a seller for silence.
-    """
-    streams = list(
-        session["live_streams"].find({"seller_id": seller_id, "is_active": True})
-    )
-    if not streams:
-        return None
-    stream_ids = [s["_id"] for s in streams]
-    messages = list(session["chat_messages"].find({"stream_id": {"$in": stream_ids}}))
-    if not messages:
-        return None
-    return stream_engagement_score(messages)
-
-
-def _restock_recommendations(
-    session,
-    seller_id: int,
-    horizon: int = 7,
-    target_days: float = 7.0,
-    safety_stock: float = 20.0,
-) -> list[dict]:
-    """Forecast-driven reorder advice for every product a seller owns."""
-    products = list(session["products"].find({"seller_id": seller_id}))
-    recommendations = []
-    for product in products:
-        orders = list(session["orders"].find({"product_id": product["_id"]}))
-        historical = [
-            {"date": o.get("created_at", "")[:10], "quantity": o.get("quantity_kg", 0)}
-            for o in orders
-        ]
-        forecast = _forecaster.predict_demand(product["_id"], historical, forecast_days=horizon)
-        values = [d.get("predicted_quantity", 0.0) for d in forecast.predictions]
-        advice = restock_advice(
-            product.get("stock_kg", 0.0),
-            values,
-            safety_stock=safety_stock,
-            target_days=target_days,
-        )
-        recommendations.append({
-            "product_id": product["_id"],
-            "product_name": product.get("name", ""),
-            "current_stock_kg": round(float(product.get("stock_kg", 0.0)), 1),
-            **advice,
-        })
-    order_priority = {"critical": 0, "high": 1, "low_stock": 2, "ok": 3, "none": 4}
-    recommendations.sort(key=lambda r: order_priority.get(r["priority"], 4))
-    return recommendations
-
-
-def _resolve_seller(
-    session,
-    seller_id: int | None = None,
-    seller_obj: dict | None = None,
-):
-    """Resolve a seller from seller_id or seller_obj (dict with email/name).
-
-    Returns the seller document, or None.
-    Creates the seller if seller_obj is provided and no matching user exists.
-    """
-    if seller_id:
-        seller = session["users"].find_one({"_id": seller_id})
-        if seller and seller.get("role") == UserRole.SELLER.value:
-            return seller
-        return None
-
-    if seller_obj:
-        email = seller_obj.get("email", "").strip()
-        name = seller_obj.get("name", "").strip()[:80]
-        location = (seller_obj.get("location") or "").strip()[:120]
-
-        # Try email first
-        if email:
-            seller = session["users"].find_one({"email": email})
-            if seller:
-                return seller
-            # Create new seller with this email
-            seller = make_user_doc(
-                username=name or "Seller",
-                email=email,
-                role=UserRole.SELLER.value,
-                location=location,
-            )
-            seller = _upsert_user_doc(session, seller)
-            return seller
-
-        # No email — try username
-        if name:
-            seller = session["users"].find_one({"username": name})
-            if seller:
-                return seller
-            email = f"{name.lower().replace(' ', '_')}@example.com"
-            seller = make_user_doc(
-                username=name,
-                email=email,
-                role=UserRole.SELLER.value,
-                location=location,
-            )
-            seller = _upsert_user_doc(session, seller)
-            return seller
-
-    return None
-
-
-def _upsert_user_doc(session, doc: dict):
-    """Insert a user or return existing one matched by email/username."""
-    email = doc.get("email", "").strip()
-    username = doc.get("username", "").strip()
-
-    if email:
-        existing = session["users"].find_one({"email": email})
-        if existing:
-            return existing
-    if username:
-        existing = session["users"].find_one({"username": username})
-        if existing:
-            return existing
-
-    doc["_id"] = _next_id(session.db)
-    doc.setdefault("created_at", _now_iso())
-    session["users"].insert_one(doc)
-    return doc
-
-
-def _next_id(db):
-    counters = db["_counters"]
-    result = counters.find_one_and_update(
-        {"_id": "next_id"},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=pymongo.ReturnDocument.AFTER,
-    )
-    return int(result["seq"])
-
-
-def _now_iso():
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+_pricing_engine = create_pricing_engine()
+_chat_nlp = get_nlp_engine()
 
 
 # ---------------------------------------------------------------------------
@@ -312,1214 +41,394 @@ def _now_iso():
 
 @api_bp.get("/health")
 def health():
-    from database.db import get_client
-    client = get_client()
-    backend = "mongomock" if "mongomock" in repr(client) else "mongodb"
-    return _ok({
-        "status": "ok",
-        "nlp_model": Config.NLP_MODEL,
-        "database": {
-            "backend": backend,
-            "name": Config.MONGO_DB,
-            "uri": Config.MONGO_URI or "mongomock://localhost",
-        },
-    })
+    try:
+        redis_available = bool(get_client().ping())
+    except RedisError:
+        redis_available = False
+    database_status = {
+        "backend": "Redis",
+        "name": "127.0.0.1:6379/0",
+        "connected": redis_available,
+    }
+    return jsonify(
+        {
+            "ok": True,
+            "status": "ok",
+            "db": redis_available,
+            "redis": redis_available,
+            "database": database_status,
+            "data": {
+                "status": "ok",
+                "db": redis_available,
+                "redis": redis_available,
+                "database": database_status,
+            },
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
-# Products
+# Chat-derived signals
+# ---------------------------------------------------------------------------
+
+def _chat_signals(chats: list[Dict[str, Any]]) -> tuple[float, Optional[float]]:
+    """Return ``(avg_sentiment, live_engagement)`` from the recent chat feed.
+
+    * ``avg_sentiment`` — simple mean of stored VADER ``sentiment_score``
+      values in [-1, 1]; ``0.0`` when the feed is empty (neutral pricing).
+    * ``live_engagement`` — share of buy-signal intents
+      (``PRICE_INQUIRY``/``QUALITY_INQUIRY``) in the feed multiplied by its
+      velocity frame; ``None`` when the feed is empty so the pricing engine
+      stays completely neutral instead of punishing a silent market.
+    """
+    if not chats:
+        return 0.0, None
+
+    sentiment_total = 0.0
+    buy_signals = 0
+    for chat in chats:
+        sentiment_total += float(chat.get("sentiment_score", 0.0) or 0.0)
+        intent = (chat.get("intent_tag") or "")
+        if intent in ("PRICE_INQUIRY", "QUALITY_INQUIRY"):
+            buy_signals += 1
+
+    avg_sentiment = sentiment_total / len(chats)
+    live_engagement = round(min(1.0, buy_signals / len(chats) + 0.3 * min(len(chats) / 20.0, 1.0)), 4)
+    return avg_sentiment, live_engagement
+
+
+def _priced_products() -> list[Dict[str, Any]]:
+    """Return all Redis products with current sentiment-driven prices."""
+    products = get_all_products()
+    avg_sentiment, live_engagement = _chat_signals(get_recent_chats(limit=20))
+
+    results = []
+    for product in products:
+        day1 = float(product.get("day1_price") or 0.0)
+        day2 = float(product.get("day2_price") or 0.0)
+        growth = (day2 - day1) / day1 if day1 > 0 else 0.0
+        demand_factor = max(0.0, min(1.0, 0.5 + growth * 4.0))
+
+        calc = _pricing_engine.calculate_optimal_price(
+            product_id=product["id"],
+            base_price=day2,
+            demand_factor=demand_factor,
+            stock_kg=float(product.get("stock_kg") or 0.0),
+            sentiment_score=avg_sentiment,
+            live_engagement=live_engagement,
+            capped=bool(product.get("capped")),
+        )
+        results.append(
+            {
+                "id": product["id"],
+                "name": product["name"],
+                "category": product["category"],
+                "day1_price": round(day1, 2),
+                "day2_price": round(day2, 2),
+                "dynamic_price": calc.optimal_price,
+                "price_change_pct": round(calc.change_pct * 100, 2),
+                "stock_kg": float(product.get("stock_kg") or 0.0),
+                "capped": calc.capped,
+                "avg_sentiment": round(avg_sentiment, 4),
+                "live_engagement": live_engagement,
+            }
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Products (Redis Hashes -> dynamic pricing -> JSON)
 # ---------------------------------------------------------------------------
 
 @api_bp.get("/api/products")
 def list_products():
-    query_param = (request.args.get("q", "") or "").strip()
-    category = (request.args.get("category", "") or "").strip()
+    """All APMC products with Redis-driven dynamic prices and chat signals."""
     try:
-        limit = min(int(request.args.get("limit", 100)), 500)
-    except (TypeError, ValueError):
-        limit = 100
-    include_dynamic = request.args.get("dynamic_price", "true").lower() == "true"
+        products = _priced_products()
+    except RedisError:
+        return jsonify({"ok": False, "error": "Redis unavailable"}), 503
+    return jsonify({"ok": True, "data": products})
 
-    with session_scope() as s:
-        query: dict = {}
-        if category:
-            query["category"] = category
 
-        if query_param:
-            # Semantic search: rank the full (category-filtered) catalog by
-            # embedding similarity, falling back to keyword matching when no
-            # product scores above the semantic threshold.
-            pool = list(s["products"].find(query).limit(500))
-            def _search_text(p):
-                return " ".join(filter(None, [
-                    str(p.get("name", "")),
-                    str(p.get("category", "")),
-                    str(p.get("description", "")),
-                ]))
-            docs = [_search_text(p) for p in pool]
-            scores = semantic_scores(query_param, docs)
-            ranked = sorted(zip(pool, scores), key=lambda t: t[1], reverse=True)
-            matched = [(p, sc) for p, sc in ranked if sc > 0.02]
-            if not matched:
-                kw = query_param.lower()
-                matched = [
-                    (p, sc) for p, sc in ranked
-                    if kw in (p.get("name", "") or "").lower()
-                    or kw in (p.get("description", "") or "").lower()
-                ]
-                if not matched:
-                    matched = [(p, sc) for p, sc in ranked if sc > 0.0]
-            products = [p for p, _ in matched[:limit]]
-        else:
-            products = list(s["products"].find(query).limit(limit))
-
-        # Attach seller info + per-seller live-stream engagement
-        live = {}
-        if include_dynamic:
-            live = {
-                seller_id: _seller_live_engagement(s, seller_id)
-                for seller_id in {p.get("seller_id") for p in products}
-            }
-        for p in products:
-            seller = _lookup_seller(s, p.get("seller_id"))
-            if seller:
-                p["seller"] = {
-                    "id": seller["_id"],
-                    "username": seller.get("username", ""),
-                    "location": seller.get("location", ""),
+@api_bp.get("/api/streams")
+def list_streams():
+    """List streams from Redis, with a default live stream for an empty set."""
+    try:
+        client = get_client()
+        stream_ids = client.smembers("streams:all")
+        if not stream_ids:
+            return jsonify(
+                {
+                    "ok": True,
+                    "data": [
+                        {
+                            "id": "1",
+                            "title": "Bangalore APMC Live Auction",
+                            "status": "active",
+                        }
+                    ],
                 }
-        response = [
-            _serialize_product(
-                s,
-                p,
-                include_dynamic,
-                live.get(p.get("seller_id")),
             )
-            for p in products
-        ]
-        return _ok(response)
 
-
-@api_bp.get("/api/products/<int:product_id>")
-def get_product(product_id):
-    with session_scope() as s:
-        product = s["products"].find_one({"_id": product_id})
-        if product is None:
-            return _err("product not found", 404)
-        seller = _lookup_seller(s, product.get("seller_id"))
-        if seller:
-            product["seller"] = {
-                "id": seller["_id"],
-                "username": seller.get("username", ""),
-                "location": seller.get("location", ""),
-            }
-        return _ok(
-            _serialize_product(
-                s,
-                product,
-                live_engagement=_seller_live_engagement(s, product.get("seller_id")),
+        streams: list[Dict[str, Any]] = []
+        for stream_id in sorted(stream_ids):
+            stream_key = (
+                stream_id if str(stream_id).startswith("stream:")
+                else f"stream:{stream_id}"
             )
-        )
+            stream = client.hgetall(stream_key)
+            if not stream:
+                continue
+            active_value = stream.get("is_active", "true")
+            status = stream.get(
+                "status",
+                "active" if str(active_value).lower() in ("1", "true", "yes") else "ended",
+            )
+            streams.append(
+                {
+                    "id": str(stream.get("id") or str(stream_id).removeprefix("stream:")),
+                    "title": stream.get("title") or stream.get("stream_title") or "Untitled stream",
+                    "status": status,
+                }
+            )
+    except RedisError:
+        return jsonify({"ok": False, "error": "Redis unavailable"}), 503
+
+    return jsonify({"ok": True, "data": streams})
 
 
-@api_bp.post("/api/products")
-def create_product():
-    payload = _payload()
-    name = (payload.get("name") or "").strip()
-    if not name:
-        return _err("name is required")
+@api_bp.put("/api/products/<product_id>")
+def update_product(product_id: str):
+    """Update seller-controlled stock, baseline price, or clamp state."""
+    if not product_id.isdigit() or int(product_id) < 1:
+        return jsonify({"ok": False, "error": "Invalid product_id"}), 400
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not payload:
+        return jsonify({"ok": False, "error": "At least one product field is required"}), 400
+    allowed_fields = {"stock_kg", "day2_price", "capped"}
+    unknown_fields = set(payload) - allowed_fields
+    if unknown_fields:
+        return jsonify(
+            {"ok": False, "error": f"Unsupported fields: {', '.join(sorted(unknown_fields))}"}
+        ), 400
+
+    fields: Dict[str, Any] = {}
+    for field in ("stock_kg", "day2_price"):
+        if field not in payload:
+            continue
+        value = payload[field]
+        if isinstance(value, bool):
+            return jsonify({"ok": False, "error": f"{field} must be a number"}), 400
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return jsonify({"ok": False, "error": f"{field} must be a number"}), 400
+        if not math.isfinite(numeric_value) or numeric_value < 0:
+            return jsonify({"ok": False, "error": f"{field} must be a finite non-negative number"}), 400
+        if field == "day2_price" and numeric_value == 0:
+            return jsonify({"ok": False, "error": "day2_price must be greater than zero"}), 400
+        fields[field] = numeric_value
+
+    if "capped" in payload:
+        if not isinstance(payload["capped"], bool):
+            return jsonify({"ok": False, "error": "capped must be a boolean"}), 400
+        fields["capped"] = "true" if payload["capped"] else "false"
 
     try:
-        price = float(payload.get("price", 0.0))
-        stock_kg = float(payload.get("stock_kg", payload.get("quantity", 0.0)))
-    except (TypeError, ValueError):
-        return _err("price and stock_kg/quantity must be numeric")
-
-    category_str = (payload.get("category") or "Vegetable").strip()
-    try:
-        category = ProductCategory(category_str).value
-    except ValueError:
-        category = ProductCategory.VEGETABLE.value
-
-    with session_scope() as s:
-        seller = _demo_seller(s)
-        if seller is None:
-            return _err("no seller in database — run the seed script first", 503)
-        doc = make_product_doc(
-            seller_id=seller["_id"],
-            name=name,
-            category=category,
-            description=payload.get("description") or "",
-            price=price,
-            stock_kg=stock_kg,
-            rating=0.0,
+        if not update_product_fields(product_id, fields):
+            return jsonify({"ok": False, "error": "Product not found"}), 404
+        updated = next(
+            (
+                product
+                for product in _priced_products()
+                if str(product["id"]) == product_id
+            ),
+            None,
         )
-        doc["_id"] = _next_id(s.db)
-        doc.setdefault("created_at", _now_iso())
-        s["products"].insert_one(doc)
+    except RedisError:
+        return jsonify({"ok": False, "error": "Redis unavailable"}), 503
 
-        result = product_to_dict(doc)
-        seller_info = _lookup_seller(s, seller["_id"])
-        if seller_info:
-            result["seller"] = {
-                "id": seller_info["_id"],
-                "username": seller_info.get("username", ""),
-                "location": seller_info.get("location", ""),
-            }
-        return _ok(result, 201)
+    if updated is None:
+        return jsonify({"ok": False, "error": "Product not found"}), 404
+    return jsonify({"ok": True, "data": updated})
 
-
-# ---------------------------------------------------------------------------
-# Orders
-# ---------------------------------------------------------------------------
 
 @api_bp.post("/api/orders")
 def create_order():
-    payload = _payload()
-    product_id = payload.get("product_id")
+    """Persist an order and reserve its inventory atomically in Redis."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "JSON request body required"}), 400
+
+    raw_product_id = payload.get("product_id")
+    product_id = str(raw_product_id).strip() if raw_product_id is not None else ""
+    buyer_id = payload.get("buyer_id")
+    buyer_id = buyer_id.strip() if isinstance(buyer_id, str) else ""
+    if not product_id.isdigit() or int(product_id) < 1:
+        return jsonify({"ok": False, "error": "Valid product_id is required"}), 400
+    if not buyer_id:
+        return jsonify({"ok": False, "error": "buyer_id is required"}), 400
+
+    quantity = payload.get("quantity_kg")
+    if isinstance(quantity, bool):
+        return jsonify({"ok": False, "error": "quantity_kg must be a positive number"}), 400
+    try:
+        quantity_kg = float(quantity)
+    except (TypeError, ValueError, OverflowError):
+        return jsonify({"ok": False, "error": "quantity_kg must be a positive number"}), 400
+    if not math.isfinite(quantity_kg) or quantity_kg <= 0:
+        return jsonify({"ok": False, "error": "quantity_kg must be a positive number"}), 400
 
     try:
-        quantity_kg = float(payload.get("quantity_kg", payload.get("quantity", 0)))
-    except (TypeError, ValueError):
-        return _err("quantity_kg/quantity must be numeric")
-
-    if quantity_kg <= 0:
-        return _err("quantity must be positive")
-
-    with session_scope() as s:
-        buyer = _demo_buyer(s)
-        if buyer is None:
-            return _err("no buyer in database — run the seed script first", 503)
-
-        product = s["products"].find_one({"_id": product_id})
+        product = get_product(product_id)
         if product is None:
-            return _err("product not found", 404)
-
-        if product.get("stock_kg", 0) < quantity_kg:
-            return _err(
-                f"insufficient stock: requested {quantity_kg}kg, available {product.get('stock_kg')}kg",
-                409,
-            )
-
-        total_price = round(product.get("price", 0.0) * quantity_kg, 2)
-
-        # Create order
-        order_doc = make_order_doc(
-            buyer_id=buyer["_id"],
-            product_id=product["_id"],
-            quantity_kg=quantity_kg,
-            total_price=total_price,
-            status=OrderStatus.CONFIRMED.value,
+            return jsonify({"ok": False, "error": "Product not found"}), 404
+        priced_product = next(
+            (
+                item
+                for item in _priced_products()
+                if str(item["id"]) == product_id
+            ),
+            None,
         )
-        order_doc["_id"] = _next_id(s.db)
-        order_doc.setdefault("created_at", _now_iso())
-        s["orders"].insert_one(order_doc)
+        if priced_product is None:
+            return jsonify({"ok": False, "error": "Product not found"}), 404
 
-        # Decrement stock
-        s["products"].update_one(
-            {"_id": product["_id"]},
-            {"$inc": {"stock_kg": -quantity_kg}},
+        order_id = str(uuid.uuid4())
+        price_per_kg = float(priced_product["dynamic_price"])
+        order_status, remaining_stock = create_redis_order(
+            product_id,
+            quantity_kg,
+            buyer_id,
+            price_per_kg,
+            order_id,
         )
-        remaining_stock = product.get("stock_kg", 0) - quantity_kg
+    except RedisError:
+        return jsonify({"ok": False, "error": "Redis unavailable"}), 503
 
-        # Capture contacts for notifications (outside session)
-        buyer_contact = buyer.get("email", "")
-        seller = _lookup_seller(s, product.get("seller_id"))
-        seller_contact = seller.get("email", buyer_contact) if seller else buyer_contact
-        product_name = product.get("name", "")
+    if order_status == "not_found":
+        return jsonify({"ok": False, "error": "Product not found"}), 404
+    if order_status == "insufficient":
+        return jsonify({"ok": False, "error": "Insufficient stock"}), 400
+    if remaining_stock is None:
+        return jsonify({"ok": False, "error": "Order could not be completed"}), 500
 
-    # Fire-and-forget notifications
-    from services import get_twilio_service
-    _twilio = get_twilio_service()
-    _twilio.send_order_confirmation(
-        to=buyer_contact, product_name=product_name,
-        quantity=quantity_kg, total_price=total_price,
-    )
-    _twilio.notify_seller_sale(
-        to=seller_contact, product_name=product_name,
-        quantity=quantity_kg, total_price=total_price,
-    )
-    if remaining_stock < 50:
-        _twilio.send_sms(
-            to=seller_contact,
-            body=f"Low stock alert: {product_name} is down to {remaining_stock:.1f}kg. Consider restocking.",
-        )
-
-    created = order_to_dict(order_doc)
-    created["buyer_username"] = buyer.get("username", "")
-    created["product_name"] = product_name
-    return _ok({"order": created, "transaction": created}, 201)
-
-
-@api_bp.post("/api/transactions")
-def create_transaction():
-    return create_order()
-
-
-@api_bp.get("/api/transactions")
-def list_transactions():
-    return _list_orders()
+    order = {
+        "id": order_id,
+        "product_id": product_id,
+        "quantity_kg": quantity_kg,
+        "buyer_id": buyer_id,
+        "price_per_kg": price_per_kg,
+        "total_price": round(quantity_kg * price_per_kg, 2),
+        "remaining_stock_kg": remaining_stock,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return jsonify({"ok": True, "data": order}), 201
 
 
 @api_bp.get("/api/orders")
 def list_orders():
-    return _list_orders()
-
-
-def _list_orders():
+    """List persistent order receipts from Redis."""
     try:
-        buyer_id = int(request.args.get("buyer_id", 0) or 0)
-    except (TypeError, ValueError):
-        buyer_id = 0
-    try:
-        product_id = int(request.args.get("product_id", 0) or 0)
-    except (TypeError, ValueError):
-        product_id = 0
-    status = (request.args.get("status", "") or "").strip()
+        orders = get_all_orders()
+    except RedisError:
+        return jsonify({"ok": False, "error": "Redis unavailable"}), 503
+    return jsonify({"ok": True, "data": orders})
 
-    with session_scope() as s:
-        query: dict = {}
-        if buyer_id:
-            query["buyer_id"] = buyer_id
-        if product_id:
-            query["product_id"] = product_id
-        if status:
-            try:
-                status_enum = OrderStatus(status)
-                query["status"] = status_enum.value
-            except ValueError:
-                pass
-
-        orders = list(s["orders"].find(query).sort("created_at", -1).limit(200))
-
-        # Attach buyer + product names
-        for o in orders:
-            buyer = _lookup_user(s, o.get("buyer_id"))
-            o["buyer_username"] = buyer.get("username", "") if buyer else ""
-            prod = _lookup_product(s, o.get("product_id"))
-            o["product_name"] = prod.get("name", "") if prod else ""
-
-        return _ok([order_to_dict(o) for o in orders])
-
-
-# ---------------------------------------------------------------------------
-# Live Streams
-# ---------------------------------------------------------------------------
-
-@api_bp.get("/api/streams")
-def list_streams():
-    active_only = request.args.get("active", "false").lower() == "true"
-    try:
-        seller_id = int(request.args.get("seller_id", 0) or 0)
-    except (TypeError, ValueError):
-        seller_id = 0
-
-    with session_scope() as s:
-        query: dict = {}
-        if seller_id:
-            query["seller_id"] = seller_id
-        if active_only:
-            query["is_active"] = True
-
-        streams = list(s["live_streams"].find(query).sort("started_at", -1).limit(50))
-        return _ok([stream_to_dict(s) for s in streams])
-
-
-@api_bp.get("/api/streams/<int:stream_id>")
-def get_stream(stream_id):
-    """Fetch a single live stream (used by the seller studio panel)."""
-    with session_scope() as s:
-        stream = s["live_streams"].find_one({"_id": stream_id})
-        if stream is None:
-            return _err("stream not found", 404)
-        result = stream_to_dict(stream)
-        seller = _lookup_seller(s, stream.get("seller_id"))
-        if seller:
-            result["seller"] = {
-                "id": seller["_id"],
-                "username": seller.get("username", ""),
-                "location": seller.get("location", ""),
-            }
-        return _ok(result)
-
-
-@api_bp.post("/api/streams")
-def create_stream():
-    payload = _payload()
-    title = (payload.get("stream_title") or "").strip()
-
-    if not title:
-        return _err("stream_title is required")
-
-    with session_scope() as s:
-        seller = _demo_seller(s)
-        if seller is None:
-            return _err("no seller in database — run the seed script first", 503)
-        seller_id = seller["_id"]
-        doc = make_live_stream_doc(
-            seller_id=seller_id,
-            stream_title=title[:200],
-            is_active=True,
-        )
-        doc["_id"] = _next_id(s.db)
-        doc.setdefault("started_at", _now_iso())
-        s["live_streams"].insert_one(doc)
-        created = stream_to_dict(doc)
-        result = created
-        seller_info = _lookup_seller(s, seller_id)
-        if seller_info:
-            result["seller"] = {
-                "id": seller_info["_id"],
-                "username": seller_info.get("username", ""),
-                "location": seller_info.get("location", ""),
-            }
-        return _ok(result, 201)
-
-
-@api_bp.post("/api/streams/<int:stream_id>/end")
-def end_stream(stream_id):
-    with session_scope() as s:
-        stream = s["live_streams"].find_one({"_id": stream_id})
-        if stream is None:
-            return _err("stream not found", 404)
-        s["live_streams"].update_one({"_id": stream_id}, {"$set": {"is_active": False}})
-        stream["is_active"] = False
-        return _ok(stream_to_dict(stream))
-
-
-# ---------------------------------------------------------------------------
-# Chat Messages
-# ---------------------------------------------------------------------------
-
-@api_bp.get("/api/streams/<int:stream_id>/messages")
-def get_chat_messages(stream_id):
-    try:
-        limit = min(int(request.args.get("limit", 100)), 500)
-    except (TypeError, ValueError):
-        limit = 100
-
-    with session_scope() as s:
-        messages = list(
-            s["chat_messages"]
-            .find({"stream_id": stream_id})
-            .sort("timestamp", -1)
-            .limit(limit)
-        )
-        # Attach usernames
-        result = []
-        for m in messages:
-            user = _lookup_user(s, m.get("user_id"))
-            result.append(chat_message_to_dict(m, username=user.get("username") if user else None))
-        return _ok(list(reversed(result)))
-
-
-@api_bp.post("/api/streams/send_message")
-def send_stream_message():
-    """REST alternative to the SocketIO ``send_message`` event."""
-    payload = _payload()
-    stream_id = payload.get("stream_id")
-    message_text = (payload.get("message_text") or "").strip()
-
-    if not stream_id or not message_text:
-        return _err("stream_id and message_text required")
-
-    # Demo identity (auth removed): host messages come from the stream's
-    # seller; an explicit valid ``user_id`` is honoured; otherwise the first
-    # seeded buyer sends the message.
-    with session_scope() as s:
-        stream = s["live_streams"].find_one({"_id": stream_id})
-        if stream is None:
-            return _err("invalid stream", 404)
-        sender = None
-        if payload.get("is_host"):
-            sender = s["users"].find_one({"_id": stream.get("seller_id")})
-        if sender is None and payload.get("user_id"):
-            candidate = s["users"].find_one({"_id": payload.get("user_id")})
-            if candidate:
-                sender = candidate
-        if sender is None:
-            sender = _demo_buyer(s)
-    if sender is None:
-        return _err("no users in database — run the seed script first", 503)
-
-    message_data = build_stream_message_data(stream_id, sender["_id"], message_text)
-    if message_data is None:
-        return _err("invalid stream or user", 404)
-
-    from api.app import socketio as _socketio  # lazy: avoid circular import at module load
-    _socketio.emit("new_message", message_data, to=f"{STREAM_ROOM_PREFIX}{stream_id}")
-    return _ok(message_data, 201)
-
-
-# ---------------------------------------------------------------------------
-# Reviews
-# ---------------------------------------------------------------------------
-
-@api_bp.get("/api/products/<int:product_id>/reviews")
-def list_reviews(product_id):
-    with session_scope() as s:
-        product = s["products"].find_one({"_id": product_id})
-        if product is None:
-            return _err("product not found", 404)
-        reviews = list(s["reviews"].find({"product_id": product_id}).sort("created_at", -1).limit(100))
-        result = []
-        for r in reviews:
-            user = _lookup_user(s, r.get("user_id"))
-            result.append(review_to_dict(r, product_name=product.get("name", ""), username=user.get("username") if user else None))
-        return _ok(result)
-
-
-@api_bp.post("/api/products/<int:product_id>/reviews")
-def create_review(product_id):
-    payload = _payload()
-    review_text = (payload.get("review_text", payload.get("comment", "")) or "").strip()
-
-    try:
-        rating = int(payload.get("rating", 0))
-    except (TypeError, ValueError):
-        return _err("rating must be an integer 1..5")
-
-    if rating < 1 or rating > 5:
-        return _err("rating must be between 1 and 5")
-
-    with session_scope() as s:
-        product = s["products"].find_one({"_id": product_id})
-        if product is None:
-            return _err("product not found", 404)
-
-        # Demo identity (auth removed): honour an explicit ``user_id`` when it
-        # exists, otherwise the review is attributed to the first seeded buyer.
-        reviewer = None
-        if payload.get("user_id"):
-            candidate = s["users"].find_one({"_id": payload.get("user_id")})
-            if candidate:
-                reviewer = candidate
-        if reviewer is None:
-            reviewer = _demo_buyer(s)
-        if reviewer is None:
-            return _err("no users in database — run the seed script first", 503)
-
-        sentiment = _nlp_engine.analyze_sentiment(review_text)
-
-        review_doc = make_review_doc(
-            product_id=product["_id"],
-            user_id=reviewer["_id"],
-            review_text=review_text,
-            rating=rating,
-            sentiment_score=sentiment["sentiment_score"],
-        )
-        review_doc["_id"] = _next_id(s.db)
-        review_doc.setdefault("created_at", _now_iso())
-        s["reviews"].insert_one(review_doc)
-
-        # Update product rating
-        all_reviews = list(s["reviews"].find({"product_id": product["_id"]}))
-        if all_reviews:
-            new_rating = sum(r.get("rating", 0) for r in all_reviews) / len(all_reviews)
-            s["products"].update_one(
-                {"_id": product["_id"]},
-                {"$set": {"rating": round(new_rating, 2)}},
-            )
-
-        result = review_to_dict(
-            review_doc,
-            product_name=product.get("name", ""),
-            username=reviewer.get("username", ""),
-        )
-        return _ok(result, 201)
-
-
-# ---------------------------------------------------------------------------
-# Recommendations
-# ---------------------------------------------------------------------------
-
-@api_bp.get("/api/recommendations/<int:user_id>")
-def get_recommendations(user_id):
-    top_n = min(int(request.args.get("top_n", 5)), 20)
-
-    with session_scope() as s:
-        user = _lookup_user(s, user_id)
-        if user is None:
-            return _err("user not found", 404)
-
-        orders = list(s["orders"].find({"buyer_id": user_id}))
-        purchase_history = [{"product_id": o["product_id"]} for o in orders]
-
-        products = list(s["products"].find().limit(500))
-        product_data = [product_to_dict(p) for p in products]
-
-        # Attach seller info
-        for p in product_data:
-            seller = _lookup_seller(s, p.get("seller_id"))
-            if seller:
-                p["seller"] = {
-                    "id": seller["_id"],
-                    "username": seller.get("username", ""),
-                    "location": seller.get("location", ""),
-                }
-
-        # Compute product sentiments
-        product_sentiments = {}
-        for p in products:
-            pid = p["_id"]
-            reviews = list(s["reviews"].find({"product_id": pid}))
-            if reviews:
-                product_sentiments[pid] = (
-                    sum(r.get("sentiment_score", 0.0) for r in reviews) / len(reviews)
-                )
-            else:
-                product_sentiments[pid] = 0.0
-
-        _recommendation_engine.fit(product_data)
-        recs = _recommendation_engine.get_recommendations(
-            user_id=user_id,
-            top_n=top_n,
-            user_purchase_history=purchase_history,
-            product_sentiments=product_sentiments,
-        )
-
-        product_map = {p["id"]: p for p in product_data}
-        results = []
-        for rec in recs:
-            prod = product_map.get(rec["product_id"])
-            if not prod:
-                continue
-            calc = _pricing_engine.calculate_optimal_price(
-                product_id=rec["product_id"],
-                base_price=prod.get("price", 0.0),
-                demand_factor=0.5,
-                stock_kg=prod.get("stock_kg", 0.0),
-                sentiment_score=product_sentiments.get(rec["product_id"], 0.0),
-            )
-            enriched = dict(prod)
-            enriched["dynamic_price"] = calc.optimal_price
-            enriched["price_change_pct"] = calc.change_pct
-            enriched["recommendation_score"] = rec["score"]
-            enriched["recommendation_reason"] = rec["reason"]
-            results.append(enriched)
-
-        return _ok(results)
-
-
-@api_bp.get("/api/recommendations")
-def get_recommendations_legacy():
-    """Legacy endpoint for content-based recommendations via query text."""
-    query_param = (request.args.get("q", "") or "").strip()
-    try:
-        top_k = min(int(request.args.get("top_k", 5)), 25)
-    except (TypeError, ValueError):
-        top_k = 5
-    if not query_param:
-        return _ok([])
-
-    with session_scope() as s:
-        products = list(s["products"].find().limit(500))
-        engine = build_engine_from_products(products)
-        scored = engine.recommend(query_param, top_k=top_k)
-        by_id = {p["_id"]: p for p in products}
-        results = []
-        for product_id, score in scored:
-            product = by_id.get(product_id)
-            if product is None:
-                continue
-            data = product_to_dict(product)
-            data["score"] = score
-            results.append(data)
-        return _ok(results)
-
-
-# ---------------------------------------------------------------------------
-# Analytics
-# ---------------------------------------------------------------------------
 
 @api_bp.get("/api/analytics")
-def self_analytics():
-    """Analytics for the first seeded seller (demo identity)."""
-    with session_scope() as s:
-        seller = _demo_seller(s)
-        if seller is None:
-            return _err("no seller in database — run the seed script first", 503)
-        return _analytics_for(seller["_id"])
-
-
-@api_bp.get("/api/analytics/<int:seller_id>")
-def get_seller_analytics(seller_id):
-    return _analytics_for(seller_id)
-
-
-def _analytics_for(seller_id: int):
-    with session_scope() as s:
-        seller = _lookup_seller(s, seller_id)
-        if seller is None or seller.get("role") != UserRole.SELLER.value:
-            return _err("seller not found", 404)
-
-        products = list(s["products"].find({"seller_id": seller_id}))
-        product_ids = [p["_id"] for p in products]
-
-        # Sales stats
-        total_orders = s["orders"].count_documents({"product_id": {"$in": product_ids}})
-        pipeline = [
-            {"$match": {"product_id": {"$in": product_ids}}},
-            {"$group": {"_id": None, "total": {"$sum": "$total_price"}}},
-        ]
-        revenue_doc = list(s["orders"].aggregate(pipeline))
-        total_revenue = revenue_doc[0]["total"] if revenue_doc else 0.0
-
-        pipeline2 = [
-            {"$match": {"product_id": {"$in": product_ids}}},
-            {"$group": {"_id": None, "total": {"$sum": "$quantity_kg"}}},
-        ]
-        qty_doc = list(s["orders"].aggregate(pipeline2))
-        total_quantity = qty_doc[0]["total"] if qty_doc else 0.0
-
-        # Sentiment summary
-        reviews = list(s["reviews"].find({"product_id": {"$in": product_ids}}))
-        sentiment_counts = {"POSITIVE": 0, "NEUTRAL": 0, "NEGATIVE": 0}
-        avg_sentiment = 0.0
-        if reviews:
-            for r in reviews:
-                label = (
-                    "POSITIVE" if r.get("sentiment_score", 0) > 0.15
-                    else ("NEGATIVE" if r.get("sentiment_score", 0) < -0.15 else "NEUTRAL")
-                )
-                sentiment_counts[label] += 1
-            avg_sentiment = sum(r.get("sentiment_score", 0) for r in reviews) / len(reviews)
-
-        # Demand forecasts
-        forecasts = []
-        for product in products[:10]:
-            orders_list = list(s["orders"].find({"product_id": product["_id"]}))
-            historical_data = [
-                {"date": o.get("created_at", "")[:10], "quantity": o.get("quantity_kg", 0)}
-                for o in orders_list
-            ]
-            forecast = _forecaster.predict_demand(product["_id"], historical_data, forecast_days=7)
-            forecasts.append({
-                "product_id": product["_id"],
-                "product_name": product.get("name", ""),
-                "predictions": forecast.predictions,
-                "trend_slope": forecast.trend_slope,
-            })
-
-        # Low stock alerts
-        low_stock = [
-            {"product_id": p["_id"], "product_name": p.get("name", ""), "stock_kg": p.get("stock_kg", 0)}
-            for p in products if p.get("stock_kg", 0) < 50
-        ]
-
-        live_engagement = _seller_live_engagement(s, seller_id)
-        restock_recommendations = _restock_recommendations(s, seller_id)
-
-        return _ok({
-            "seller": user_to_dict(seller),
-            "sales_summary": {
-                "total_orders": total_orders,
-                "total_revenue": round(total_revenue, 2),
-                "total_quantity_kg": round(total_quantity, 2),
-                "avg_order_value": round(total_revenue / total_orders, 2) if total_orders else 0.0,
-            },
-            "sentiment_summary": {
-                "counts": sentiment_counts,
-                "average_score": round(avg_sentiment, 4),
-                "total_reviews": len(reviews),
-            },
-            "demand_forecasts": forecasts,
-            "low_stock_alerts": low_stock,
-            "live_engagement": (
-                round(live_engagement, 4) if live_engagement is not None else None
-            ),
-            "restock_recommendations": restock_recommendations,
-        })
-
-
-# ---------------------------------------------------------------------------
-# Dynamic Pricing
-# ---------------------------------------------------------------------------
-
-@api_bp.get("/api/pricing/<int:product_id>")
-def get_pricing_suggestion(product_id):
-    with session_scope() as s:
-        product = s["products"].find_one({"_id": product_id})
-        if product is None:
-            return _err("product not found", 404)
-
-        reviews = list(s["reviews"].find({"product_id": product_id}))
-        avg_sentiment = (
-            sum(r.get("sentiment_score", 0.0) for r in reviews) / len(reviews)
-            if reviews else 0.0
-        )
-
-        orders_count = s["orders"].count_documents({"product_id": product_id})
-        demand_factor = min(0.5 + (orders_count * 0.02), 1.0)
-
-        calc = _pricing_engine.calculate_optimal_price(
-            product_id=product["_id"],
-            base_price=product.get("price", 0.0),
-            demand_factor=demand_factor,
-            stock_kg=product.get("stock_kg", 0.0),
-            sentiment_score=avg_sentiment,
-        )
-
-        return _ok({
-            "product_id": product["_id"],
-            "product_name": product.get("name", ""),
-            "base_price": calc.base_price,
-            "optimal_price": calc.optimal_price,
-            "suggested_price": calc.optimal_price,
-            "change_pct": calc.change_pct,
-            "demand_factor": calc.demand_factor,
-            "stock_factor": calc.stock_factor,
-            "sentiment_factor": calc.sentiment_factor,
-            "capped": calc.capped,
-        })
-
-
-@api_bp.post("/api/products/<int:product_id>/price/apply")
-def apply_price(product_id):
-    with session_scope() as s:
-        product = s["products"].find_one({"_id": product_id})
-        if product is None:
-            return _err("product not found", 404)
-
-        transactions = list(s["orders"].find({"product_id": product_id}))
-        demand = demand_score(transactions)
-        suggestion = _pricing_engine.calculate_optimal_price(
-            product_id=product["_id"],
-            base_price=product.get("price", 0.0),
-            demand_factor=demand,
-            stock_kg=product.get("stock_kg", 0.0),
-        )
-
-        log_doc = make_price_log_doc(
-            product_id=product["_id"],
-            old_price=product.get("price", 0.0),
-            new_price=suggestion.optimal_price,
-            reason=suggestion.reason,
-        )
-        log_doc["_id"] = _next_id(s.db)
-        log_doc.setdefault("created_at", _now_iso())
-        s["price_logs"].insert_one(log_doc)
-
-        s["products"].update_one(
-            {"_id": product_id},
-            {"$set": {"price": suggestion.optimal_price}},
-        )
-        new_price = suggestion.optimal_price
-
-    return _ok({
-        "product_id": product["_id"],
-        "new_price": new_price,
-        "base_price": suggestion.base_price,
-        "suggested_price": suggestion.optimal_price,
-        "change_pct": suggestion.change_pct,
-        "reason": suggestion.reason,
-        "demand_factor": suggestion.demand_factor,
-        "stock_factor": suggestion.stock_factor,
-    })
-
-
-# ---------------------------------------------------------------------------
-# Product Analytics
-# ---------------------------------------------------------------------------
-
-@api_bp.get("/api/products/<int:product_id>/analytics")
-def product_analytics(product_id):
-    with session_scope() as s:
-        product = s["products"].find_one({"_id": product_id})
-        if product is None:
-            return _err("product not found", 404)
-
-        transactions = list(s["orders"].find({"product_id": product_id}))
-        reviews = list(s["reviews"].find({"product_id": product_id}))
-        price_logs = list(s["price_logs"].find({"product_id": product_id}).sort("created_at", 1))
-
-        # Peer prices
-        peer_prices = [
-            p.get("price", 0)
-            for p in s["products"].find({
-                "category": product.get("category"),
-                "_id": {"$ne": product_id},
-                "price": {"$gt": 0},
-            })
-            if p.get("price", 0) > 0
-        ]
-        competitor_min = min(peer_prices) if peer_prices else None
-        competitor_max = max(peer_prices) if peer_prices else None
-
-        demand = demand_score(transactions)
-        avg_sentiment = (
-            sum(r.get("sentiment_score", 0.0) for r in reviews) / len(reviews)
-            if reviews else 0.0
-        )
-
-        suggestion = _pricing_engine.calculate_optimal_price(
-            product_id=product["_id"],
-            base_price=product.get("price", 0.0),
-            demand_factor=demand,
-            stock_kg=product.get("stock_kg", 0.0),
-            sentiment_score=avg_sentiment,
-        )
-
-        return _ok({
-            "product": product_to_dict(product),
-            "summary": sales_summary(transactions),
-            "ratings": rating_summary(reviews),
-            "demand_score": demand,
-            "daily_revenue": revenue_by_day(transactions),
-            "price_histories": [price_log_to_dict(log) for log in price_logs],
-            "suggested_price": {
-                "suggested_price": suggestion.optimal_price,
-                "base_price": suggestion.base_price,
-                "change_pct": suggestion.change_pct,
-                "reason": suggestion.reason,
-                "demand_factor": suggestion.demand_factor,
-                "stock_factor": suggestion.stock_factor,
-            },
-        })
-
-
-# ---------------------------------------------------------------------------
-# Product Forecast
-# ---------------------------------------------------------------------------
-
-@api_bp.get("/api/products/<int:product_id>/forecast")
-def product_forecast(product_id):
+def market_analytics():
+    """Aggregate live inventory and pricing metrics directly from Redis."""
     try:
-        horizon = int(request.args.get("horizon", 7))
-    except (TypeError, ValueError):
-        horizon = 7
+        products = _priced_products()
+    except RedisError:
+        return jsonify({"ok": False, "error": "Redis unavailable"}), 503
 
-    with session_scope() as s:
-        product = s["products"].find_one({"_id": product_id})
-        if product is None:
-            return _err("product not found", 404)
-
-        orders = list(s["orders"].find({"product_id": product_id}))
-        historical_data = [
-            {"date": o.get("created_at", "")[:10], "quantity": o.get("quantity_kg", 0)}
-            for o in orders
-        ]
-        forecast = _forecaster.predict_demand(
-            product["_id"], historical_data, forecast_days=horizon,
-        )
-
-        return _ok({
-            "product_id": product["_id"],
-            "history": [{"date": d["date"], "quantity": d["predicted_quantity"]} for d in forecast.predictions] if historical_data else [],
-            "history_dates": [d["date"] for d in forecast.predictions] if historical_data else [],
-            "dates": [d["date"] for d in forecast.predictions],
-            "values": [d["predicted_quantity"] for d in forecast.predictions],
-            "trend_slope": forecast.trend_slope,
-        })
+    total_stock_kg = sum(float(product.get("stock_kg") or 0.0) for product in products)
+    surge_values = [
+        (float(product.get("dynamic_price") or 0.0) - float(product["day2_price"]))
+        / float(product["day2_price"])
+        * 100.0
+        for product in products
+        if float(product.get("day2_price") or 0.0) > 0
+    ]
+    metrics = {
+        "total_products": len(products),
+        "total_stock_kg": round(total_stock_kg, 2),
+        "avg_surge_pct": round(sum(surge_values) / len(surge_values), 2)
+        if surge_values
+        else 0.0,
+        "low_stock_count": sum(
+            float(product.get("stock_kg") or 0.0) < 50.0 for product in products
+        ),
+    }
+    return jsonify({"ok": True, **metrics, "data": metrics})
 
 
 # ---------------------------------------------------------------------------
-# Demand Forecast
+# Chat feed (Redis List) — REST mirror of the SocketIO live feed
 # ---------------------------------------------------------------------------
 
-@api_bp.get("/api/forecast/<int:product_id>")
-def get_demand_forecast(product_id):
+@api_bp.get("/api/streams/chats")
+def recent_chats():
+    """Newest analysed chat messages (default 20) for polling clients."""
+    limit = request.args.get("limit", 20, type=int)
     try:
-        horizon = min(int(request.args.get("horizon", 7)), 30)
-    except (TypeError, ValueError):
-        horizon = 7
-
-    with session_scope() as s:
-        product = s["products"].find_one({"_id": product_id})
-        if product is None:
-            return _err("product not found", 404)
-
-        orders = list(s["orders"].find({"product_id": product_id}))
-        historical_data = [
-            {"date": o.get("created_at", "")[:10], "quantity": o.get("quantity_kg", 0)}
-            for o in orders
-        ]
-        forecast = _forecaster.predict_demand(product["_id"], historical_data, forecast_days=horizon)
-
-        return _ok({
-            "product_id": product["_id"],
-            "product_name": product.get("name", ""),
-            "forecast": forecast.predictions,
-            "trend_slope": forecast.trend_slope,
-            "model_used": forecast.model_used,
-        })
+        chats = get_recent_chats(limit=limit)
+    except RedisError:
+        return jsonify({"ok": False, "error": "Redis unavailable"}), 503
+    return jsonify({"ok": True, "data": chats})
 
 
-# ---------------------------------------------------------------------------
-# Users
-# ---------------------------------------------------------------------------
+@api_bp.post("/api/streams/chats")
+def post_chat():
+    """Buyer chat ingestion — VADER sentiment + keyword intent -> Redis List.
 
-@api_bp.get("/api/users")
-def list_users():
-    """List platform users (id, username, role, location)."""
-    with session_scope() as s:
-        users = list(s["users"].find().sort("_id", 1).limit(500))
-        return _ok([user_to_dict(u) for u in users])
+    The pushed scores immediately feed ``_chat_signals`` on the next
+    ``GET /api/products`` poll, so buy-signal intent chatter visibly nudges
+    the dynamic prices within one 3-second UI cycle.
+    """
+    payload = request.get_json(silent=True) or {}
+    message_text = (payload.get("message") or payload.get("message_text") or "").strip()
+    if not message_text:
+        return jsonify({"ok": False, "error": "message or message_text required"}), 400
 
+    sentiment = _chat_nlp.analyze_sentiment(message_text)
+    intent = _chat_nlp.detect_intent(message_text)
 
-# ---------------------------------------------------------------------------
-# Seller + Inventory endpoints (added for frontend API unification)
-# ---------------------------------------------------------------------------
-
-@api_bp.get("/api/seller")
-def self_seller():
-    """Seller profile for the first seeded seller (demo identity)."""
-    with session_scope() as s:
-        seller = _demo_seller(s)
-        if seller is None:
-            return _err("seller not found", 404)
-        return _ok({"seller": user_to_dict(seller)})
-
-
-@api_bp.get("/api/seller/<int:seller_id>")
-def get_seller(seller_id):
-    with session_scope() as s:
-        seller = _lookup_seller(s, seller_id)
-        if seller is None:
-            return _err("seller not found", 404)
-        return _ok({"seller": user_to_dict(seller)})
-
-
-@api_bp.get("/api/seller/orders")
-def self_seller_orders():
-    with session_scope() as s:
-        seller = _demo_seller(s)
-        if seller is None:
-            return _err("seller not found or not a seller", 404)
-        return _seller_orders(seller["_id"])
-
-
-@api_bp.get("/api/seller/<int:seller_id>/orders")
-def get_seller_orders(seller_id):
-    """Orders for a seller's products — powers the seller-studio orders tab."""
-    return _seller_orders(seller_id)
-
-
-def _seller_orders(seller_id: int):
-    with session_scope() as s:
-        seller = _lookup_seller(s, seller_id)
-        if seller is None or seller.get("role") != UserRole.SELLER.value:
-            return _err("seller not found or not a seller", 404)
-
-        product_ids = [
-            p["_id"]
-            for p in s["products"].find({"seller_id": seller_id}, {"_id": 1})
-        ]
-        orders = list(
-            s["orders"]
-            .find({"product_id": {"$in": product_ids}})
-            .sort("created_at", -1)
-            .limit(200)
-        )
-
-        result = []
-        for o in orders:
-            buyer = _lookup_user(s, o.get("buyer_id"))
-            prod = _lookup_product(s, o.get("product_id"))
-            entry = order_to_dict(
-                o,
-                buyer_username=buyer.get("username", "") if buyer else "",
-                product_name=prod.get("name", "") if prod else "",
-            )
-            entry["buyer"] = (
-                {
-                    "id": buyer["_id"],
-                    "username": buyer.get("username", ""),
-                    "email": buyer.get("email", ""),
-                    "location": buyer.get("location", ""),
-                }
-                if buyer
-                else {}
-            )
-            entry["ordered_at"] = o.get("created_at", "")
-            result.append(entry)
-
-        return _ok(result)
-
-
-@api_bp.get("/api/seller/inventory")
-def self_seller_inventory():
-    with session_scope() as s:
-        seller = _demo_seller(s)
-        if seller is None:
-            return _err("seller not found or not a seller", 404)
-        return _seller_inventory(seller["_id"])
-
-
-@api_bp.get("/api/seller/<int:seller_id>/inventory")
-def get_seller_inventory(seller_id):
-    return _seller_inventory(seller_id)
-
-
-def _seller_inventory(seller_id: int):
-    with session_scope() as s:
-        seller = _lookup_seller(s, seller_id)
-        if seller is None or seller.get("role") != UserRole.SELLER.value:
-            return _err("seller not found or not a seller", 404)
-
-        products = list(s["products"].find({"seller_id": seller_id}))
-        live_engagement = _seller_live_engagement(s, seller_id)
-        restock = {
-            r["product_id"]: r
-            for r in _restock_recommendations(s, seller_id)
-        }
-        results = []
-        for p in products:
-            reviews = list(s["reviews"].find({"product_id": p["_id"]}))
-            avg_sentiment = (
-                sum(r.get("sentiment_score", 0.0) for r in reviews) / len(reviews)
-                if reviews else 0.0
-            )
-            orders = list(s["orders"].find({"product_id": p["_id"]}))
-            demand = demand_score(orders)
-
-            calc = _pricing_engine.calculate_optimal_price(
-                product_id=p["_id"],
-                base_price=p.get("price", 0.0),
-                demand_factor=demand,
-                stock_kg=p.get("stock_kg", 0.0),
-                sentiment_score=avg_sentiment,
-                live_engagement=live_engagement,
-            )
-
-            stock = p.get("stock_kg", 0)
-            if stock <= 0:
-                status = "🔴 Out of Stock"
-            elif stock < 20:
-                status = "🔴 Critical"
-            elif stock < 50:
-                status = "🟠 Low"
-            elif stock > 500:
-                status = "🔵 Overstock"
-            else:
-                status = "🟢 Good"
-
-            results.append({
-                "product": product_to_dict(p),
-                "dynamic_price": calc.optimal_price,
-                "price_change_pct": calc.change_pct,
-                "live_engagement": (
-                    round(live_engagement, 4) if live_engagement is not None else None
-                ),
-                "live_price_boost_pct": round(calc.live_factor * 100, 2),
-                "status": status,
-                "restock": restock.get(p["_id"]),
-            })
-
-        return _ok(results)
-
-
-# ---------------------------------------------------------------------------
-# Market data (Agmarknet price & arrival reports)
-# ---------------------------------------------------------------------------
-
-@api_bp.post("/api/market/ingest")
-def market_ingest():
-    """Upload a Marketwise Price & Arrival PDF (or CSV) and ingest it."""
-    from market_data import ingest_records, parse_file
-
-    upload = request.files.get("file")
-    if upload is None or not upload.filename:
-        return _err("multipart 'file' field required", 400)
-
-    filename = upload.filename
-    raw = upload.read()
-    if len(raw) > 5 * 1024 * 1024:
-        return _err("file too large (max 5MB)", 413)
-
-    if filename.lower().endswith(".pdf"):
-        from market_data import parse_pdf
-        from market_data.parser import ParseResult
-        import tempfile
-        import os
-        fd, tmp = tempfile.mkstemp(suffix=".pdf")
-        try:
-            os.write(fd, raw)
-            os.close(fd)
-            parsed = parse_pdf(tmp, source=filename)
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-    else:
-        import io
-        from market_data import parse_csv
-        from market_data.parser import ParseResult
-        parsed = parse_csv(io.BytesIO(raw), source=filename)
-
-    with session_scope() as s:
-        seller = _demo_seller(s)
-    actor = seller.get("username") if seller else "unknown"
-    ingested = ingest_records(parsed.records, source=filename,
-                              ingest_context=f"uploaded by {actor}")
-    return _ok({
-        "parsed": {
-            "records": len(parsed.records),
-            "errors": len(parsed.errors),
-            "report_date": parsed.meta.get("report_date"),
-            "generated_at": parsed.meta.get("generated_at"),
-        },
-        "ingested": ingested,
-        "error_rows": parsed.errors[:20],
-    }, 201)
-
-
-@api_bp.get("/api/market/prices")
-def market_prices():
-    commodity = (request.args.get("commodity") or "").strip() or None
-    market = (request.args.get("market") or "").strip() or None
-    group = (request.args.get("group") or "").strip() or None
-    date_from = (request.args.get("from") or "").strip() or None
-    date_to = (request.args.get("to") or "").strip() or None
-    limit = min(int(request.args.get("limit", 500) or 500), 1000)
-
-    from market_data import list_market_prices
-    rows = list_market_prices(
-        commodity=commodity,
-        market=market,
-        group=group,
-        date_from=date_from,
-        date_to=date_to,
-        limit=limit,
+    message_doc = {
+        "stream_id": payload.get("stream_id") or "active",
+        "product_id": str(payload["product_id"]) if payload.get("product_id") is not None else None,
+        "user_id": payload.get("user_id") or 0,
+        "username": (payload.get("username") or "").strip() or "demo_buyer",
+        "is_host": bool(payload.get("is_host")),
+        "message_text": message_text,
+        "sentiment_score": sentiment["sentiment_score"],
+        "sentiment_label": sentiment["sentiment_label"],
+        "intent_tag": intent,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        push_chat_message(message_doc)
+        priced_products = _priced_products()
+    except RedisError:
+        return jsonify({"ok": False, "error": "Redis unavailable"}), 503
+    updated_product = next(
+        (
+            product
+            for product in priced_products
+            if str(product["id"]) == str(message_doc["product_id"])
+        ),
+        None,
     )
-    return _ok(rows)
-
-
-@api_bp.get("/api/market/commodities")
-def market_commodities():
-    from market_data import distinct_commodities
-    return _ok(distinct_commodities())
-
-
-@api_bp.get("/api/market/series")
-def market_series():
-    commodity = (request.args.get("commodity") or "").strip()
-    market = (request.args.get("market") or "").strip() or None
-    if not commodity:
-        return _err("commodity query param required", 400)
-    from market_data import price_series
-    return _ok(price_series(commodity, market=market))
-
-
-@api_bp.get("/api/market/status")
-def market_status():
-    from market_data import ingest_status, recent_ingest_log
-    return _ok({
-        "stats": ingest_status(),
-        "recent_ingests": recent_ingest_log(limit=10),
-    })
-
-
-@api_bp.get("/api/market/ingest_log")
-def market_ingest_log():
-    from market_data import recent_ingest_log
-    return _ok(recent_ingest_log(limit=50))
-
-
-# ---------------------------------------------------------------------------
-# Import Config for health endpoint (must be at end to avoid circular import)
-# ---------------------------------------------------------------------------
-
-from config import Config
+    return jsonify(
+        {
+            "ok": True,
+            "data": message_doc,
+            "product": updated_product,
+            "dynamic_price": (
+                updated_product["dynamic_price"] if updated_product else None
+            ),
+        }
+    ), 201

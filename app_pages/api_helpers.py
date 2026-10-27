@@ -11,27 +11,48 @@ Improvements covered here:
 
 from __future__ import annotations
 
+import sys
+import http.client
 import json
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, cast
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+API_BASE_URL: str = "http://127.0.0.1:5000"
+BASE_URL = API_BASE_URL
+
+
+class C:
+    API_BASE_URL: str = "http://127.0.0.1:5000"
+
+
 try:
     from config import Config
 except Exception:
-    Config = type("C", (), {})()
-    Config.API_BASE_URL = "http://localhost:5000"
+    Config = C
+else:
+    Config.API_BASE_URL = API_BASE_URL
+
+
+BadgeColor = Literal[
+    "red", "orange", "yellow", "blue", "green", "violet", "gray", "grey", "primary"
+]
 
 
 def _api_base_url() -> str:
     """Return the API base URL, reading fresh from Config each call."""
-    return getattr(Config, "API_BASE_URL", "http://localhost:5000").rstrip("/")
+    return getattr(Config, "API_BASE_URL", BASE_URL).rstrip("/")
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +184,7 @@ def _api_get(
     params: Optional[Dict[str, Any]] = None,
     ttl: int = 20,
     show_spinner: bool = False,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """Cached GET to the backend."""
 
     @st.cache_data(ttl=ttl, show_spinner=show_spinner)
@@ -175,7 +196,11 @@ def _api_get(
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        except http.client.HTTPException as exc:
+            print(f"[api_helpers] {url} returned an invalid HTTP response: {exc}")
+            return None
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+            print(f"[api_helpers] {url} request failed: {exc}")
             return None
 
     url = f"{_api_base_url()}{path}"
@@ -212,6 +237,37 @@ def _api_post(
             return json.loads(exc.read().decode("utf-8"))
         except (ValueError, OSError):
             return {"ok": False, "error": f"HTTP {exc.code}"}
+    except http.client.HTTPException as exc:
+        print(f"[api_helpers] {path} returned an invalid HTTP response: {exc}")
+        return None
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"[api_helpers] {path} error: {exc}")
+        return None
+
+
+def _api_put(
+    path: str,
+    data: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """PUT JSON to the REST backend, preserving server error payloads."""
+    url = f"{_api_base_url()}{path}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(data).encode("utf-8"),
+        headers=_http_headers({"Content-Type": "application/json"}),
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except (ValueError, OSError):
+            return {"ok": False, "error": f"HTTP {exc.code}"}
+    except http.client.HTTPException as exc:
+        print(f"[api_helpers] {path} returned an invalid HTTP response: {exc}")
+        return None
     except (urllib.error.URLError, OSError) as exc:
         print(f"[api_helpers] {path} error: {exc}")
         return None
@@ -251,6 +307,9 @@ def _api_upload(
             return json.loads(exc.read().decode("utf-8"))
         except (ValueError, OSError):
             return {"ok": False, "error": f"HTTP {exc.code}"}
+    except http.client.HTTPException as exc:
+        print(f"[api_helpers] {path} upload returned an invalid HTTP response: {exc}")
+        return None
     except (urllib.error.URLError, OSError) as exc:
         print(f"[api_helpers] {path} upload error: {exc}")
         return None
@@ -273,11 +332,15 @@ def badge_sentiment(sentiment: str, delta: float = 0.0) -> None:
     }
     icon = icon_map.get(sentiment, fallback_name(sentiment))
     color = color_map.get(sentiment, "grey")
-    st.badge(label=f"{sentiment}  ({delta:+.1%})", icon=f":material/{icon}:", color=color)
+    st.badge(
+        label=f"{sentiment}  ({delta:+.1%})",
+        icon=f":material/{icon}:",
+        color=cast(BadgeColor, color),
+    )
 
 
 def badge_status(text: str, color: str = "blue", icon: str = "info") -> None:
-    st.badge(label=text, icon=f":material/{icon}:", color=color)
+    st.badge(label=text, icon=f":material/{icon}:", color=cast(BadgeColor, color))
 
 
 def badge_trend(direction: float, suffix: str = "%") -> None:
@@ -287,14 +350,18 @@ def badge_trend(direction: float, suffix: str = "%") -> None:
     st.badge(
         label=f"{'+' if delta > 0 else ''}{delta:.1f}{suffix}",
         icon=f":material/{icon}:",
-        color=color,
+        color=cast(BadgeColor, color),
     )
 
 
 def badge_rating(rating: float) -> None:
     icon = "star" if rating > 0 else "star_outline"
     color = "green" if rating >= 4.0 else ("orange" if rating >= 3.0 else "gray")
-    st.badge(label=f"{rating:.1f} / 5.0", icon=f":material/{icon}:", color=color)
+    st.badge(
+        label=f"{rating:.1f} / 5.0",
+        icon=f":material/{icon}:",
+        color=cast(BadgeColor, color),
+    )
 
 
 def fallback_name(name: str) -> str:
@@ -396,16 +463,22 @@ def product_card_row(product: Dict[str, Any], index: int) -> None:
         buyer = current_user()
         if buyer:
             def _place_order():
-                item = product
-                _api_post(
+                buyer_id = buyer.get("id") or buyer.get("username") or "demo_buyer"
+                response = _api_post(
                     "/api/orders",
                     {
-                        "product_id": int(product["id"]),
+                        "product_id": str(product["id"]),
                         "quantity_kg": 1.0,
-                        "price_per_kg": item.get("price", 0.0),
+                        "buyer_id": str(buyer_id),
                     },
                 )
-                st.rerun()
+                if response and response.get("ok"):
+                    st.toast("Order placed; inventory has been updated.")
+                    st.rerun()
+                else:
+                    st.error(
+                        (response or {}).get("error", "Could not place the order.")
+                    )
 
             st.button(
                 f"{material_symbol('shopping_cart')}  Buy 1 kg as {buyer.get('username', '')}",

@@ -189,8 +189,8 @@ class DynamicPricingEngine:
 
     def __init__(
         self,
-        min_price_ratio: float = 0.8,
-        max_price_ratio: float = 1.2,
+        min_price_ratio: float = 0.85,
+        max_price_ratio: float = 1.25,
         stock_high_threshold: float = 500.0,
         sentiment_boost_max: float = 0.05
     ) -> None:
@@ -206,7 +206,8 @@ class DynamicPricingEngine:
         demand_factor: float = 0.5,
         stock_kg: float = 0.0,
         sentiment_score: float = 0.0,
-        live_engagement: Optional[float] = None
+        live_engagement: Optional[float] = None,
+        capped: bool = False,
     ) -> PriceCalculation:
         """Calculate optimal price using the formula:
         Optimal Price = Base Price * (1 + Demand Factor - Stock Factor + Sentiment Factor)
@@ -221,7 +222,7 @@ class DynamicPricingEngine:
                 stock_factor=0.0,
                 sentiment_factor=0.0,
                 change_pct=0.0,
-                capped=False
+                capped=capped
             )
 
         # Demand Factor: 0.0 to 1.0, higher demand -> higher price
@@ -254,16 +255,22 @@ class DynamicPricingEngine:
         optimal_price = base * multiplier
 
         # Cap within bounds
-        min_price = base * self.min_price_ratio
-        max_price = base * self.max_price_ratio
-        capped = False
+        min_ratio = max(0.85, min(self.min_price_ratio, 1.25))
+        max_ratio = min(1.25, max(self.max_price_ratio, 0.85))
+        if min_ratio > max_ratio:
+            min_ratio, max_ratio = 0.85, 1.25
+        min_price = base * min_ratio
+        max_price = base * max_ratio
+        was_clamped = capped
 
-        if optimal_price < min_price:
+        if capped:
+            optimal_price = base
+        elif optimal_price < min_price:
             optimal_price = min_price
-            capped = True
+            was_clamped = True
         elif optimal_price > max_price:
             optimal_price = max_price
-            capped = True
+            was_clamped = True
 
         change_pct = round((optimal_price - base) / base, 4) if base else 0.0
 
@@ -275,7 +282,7 @@ class DynamicPricingEngine:
             stock_factor=round(stock_adj, 4),
             sentiment_factor=round(sentiment_adj, 4),
             change_pct=change_pct,
-            capped=capped,
+            capped=was_clamped,
             live_factor=round(live_adj, 4),
         )
 

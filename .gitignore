@@ -85,6 +85,7 @@ data/*.sqlite3
 *.sqlite
 *.sqlite3
 *.db
+*.rdb
 
 
 # --- App specific ---

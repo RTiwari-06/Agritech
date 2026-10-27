@@ -1,74 +1,66 @@
-# Agritech Marketplace — custom theme (dark, agricultural green)
-
+# Fieldnote — warm, editorial market workspace
 [theme]
-base = "dark"
-primaryColor = "#4CB944"          # fresh produce green
-backgroundColor = "#0D1B14"       # deep green-black
-secondaryBackgroundColor = "#15281D"
-codeBackgroundColor = "#15281D"
-textColor = "#E8F1EC"
-linkColor = "#7ED957"
-borderColor = "#2B4235"
-codeTextColor = "#C5D7CC"
+base = "light"
+primaryColor = "#287D58"
+backgroundColor = "#F5F7F2"
+secondaryBackgroundColor = "#FFFFFF"
+codeBackgroundColor = "#EEF2EB"
+textColor = "#1F352B"
+linkColor = "#287D58"
+borderColor = "#DCE5DD"
+codeTextColor = "#325143"
 showWidgetBorder = true
 showSidebarBorder = true
-baseRadius = "8px"
-buttonRadius = "8px"
-
-# Typography — clean, readable sans-serif
-font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
-headingFont = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
-codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
-baseFontSize = 14
+baseRadius = "12px"
+buttonRadius = "10px"
+font = "sans serif"
+headingFont = "sans serif"
+codeFont = "monospace"
+baseFontSize = 15
 baseFontWeight = 400
-headingFontSizes = ["28px", "22px", "18px", "16px", "14px", "12px"]
-headingFontWeights = [700, 600, 600, 600, 500, 500]
+headingFontSizes = ["32px", "26px", "21px", "18px", "15px", "13px"]
+headingFontWeights = [700, 700, 600, 600, 500, 500]
 linkUnderline = false
 
-# Semantic colors
-greenColor = "#34D399"
-redColor = "#F87171"
-yellowColor = "#FBBF24"
-orangeColor = "#FB923C"
-blueColor = "#5EB0EF"
-violetColor = "#A78BFA"
-grayColor = "#94A3B8"
+greenColor = "#287D58"
+redColor = "#B5473C"
+yellowColor = "#9A6E08"
+orangeColor = "#B65B2B"
+blueColor = "#3976A8"
+violetColor = "#7454A1"
+grayColor = "#66766D"
 
-# Chart colors — distinguishable categorical palette
 chartCategoricalColors = [
-    "#4CB944",
-    "#34D399",
-    "#5EB0EF",
-    "#FBBF24",
-    "#F87171",
-    "#A78BFA",
-    "#FB923C",
-    "#94A3B8",
+    "#287D58",
+    "#3976A8",
+    "#B65B2B",
+    "#7454A1",
+    "#9A6E08",
+    "#2D8A83",
+    "#B5473C",
+    "#66766D",
 ]
 
-# Sequential colors for heatmaps/gradients (green ramp)
 chartSequentialColors = [
-    "#051F13",
-    "#082F1C",
-    "#0B4726",
-    "#0F5F31",
-    "#147C3B",
-    "#1B9E46",
-    "#34D399",
-    "#6EE7B7",
-    "#A7F3D0",
-    "#D1FAE5",
+    "#F0F6EF",
+    "#DCEBDD",
+    "#C5DFC9",
+    "#A6D0B2",
+    "#82BD98",
+    "#5AA67B",
+    "#3D9065",
+    "#287D58",
+    "#1F6649",
+    "#174C38",
 ]
 
-# Dataframe styling
-dataframeBorderColor = "#2B4235"
-dataframeHeaderBackgroundColor = "#15281D"
+dataframeBorderColor = "#DCE5DD"
+dataframeHeaderBackgroundColor = "#EEF3ED"
 
-# Sidebar
 [theme.sidebar]
-backgroundColor = "#0D1B14"
-secondaryBackgroundColor = "#15281D"
-codeBackgroundColor = "#15281D"
-textColor = "#E8F1EC"
-borderColor = "#2B4235"
-primaryColor = "#4CB944"
+backgroundColor = "#EDF2EB"
+secondaryBackgroundColor = "#FFFFFF"
+codeBackgroundColor = "#E5ECE4"
+textColor = "#1F352B"
+borderColor = "#DCE5DD"
+primaryColor = "#287D58"

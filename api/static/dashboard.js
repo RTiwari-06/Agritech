@@ -114,10 +114,14 @@
       badgeEl.textContent = "● Online";
       badgeEl.className = "health-badge ok";
       const db = health.database || {};
-      dbEl.textContent = `DB: ${db.backend || "—"} · ${db.name || "—"}`;
+      const connected = Boolean(health.db ?? health.redis ?? db.connected);
+      dbEl.textContent = connected
+        ? `DB: ${db.backend || "Redis"} · ${db.name || "127.0.0.1:6379/0"}`
+        : "DB: Redis unavailable · 127.0.0.1:6379/0";
     } else {
       badgeEl.textContent = "● Offline";
       badgeEl.className = "health-badge down";
+      dbEl.textContent = "DB: Unavailable · 127.0.0.1:6379/0";
     }
   }
 
@@ -147,7 +151,7 @@
 
   async function loadStreams() {
     const all = (await guard(() => api("/api/streams"), "Could not load streams")) || [];
-    activeStreams = all.filter((s) => s.is_active);
+    activeStreams = all.filter((s) => s.is_active ?? s.status === "active");
   }
 
   // ---------------- Overview ----------------
@@ -259,12 +263,12 @@
     list.innerHTML = allStreams
       .map(
         (s) => `<div class="stream-item ${s.id === selectedStreamId ? "selected" : ""}" data-stream="${s.id}">
-          <span class="live-dot ${s.is_active ? "on" : "off"}"></span>
+          <span class="live-dot ${(s.is_active ?? s.status === "active") ? "on" : "off"}"></span>
           <div>
-            <strong>${escapeHtml(s.stream_title)}</strong>
-            <div class="muted">Seller #${s.seller_id} · started ${fmtDate(s.started_at)}</div>
+            <strong>${escapeHtml(s.stream_title || s.title || "Untitled stream")}</strong>
+            <div class="muted">${s.seller_id ? `Seller #${s.seller_id} · ` : ""}started ${fmtDate(s.started_at)}</div>
           </div>
-          <span class="badge ${s.is_active ? "delivered" : "CANCELLED"}">${s.is_active ? "LIVE" : "Ended"}</span>
+          <span class="badge ${(s.is_active ?? s.status === "active") ? "delivered" : "CANCELLED"}">${(s.is_active ?? s.status === "active") ? "LIVE" : "Ended"}</span>
         </div>`
       )
       .join("");

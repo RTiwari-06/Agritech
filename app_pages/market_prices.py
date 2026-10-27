@@ -1,205 +1,178 @@
-"""Agritech — market prices page (Agmarknet data).
-
-Public view: commodity price/arrival series and price-vs-MSP insights,
-fed by real "Marketwise Price & Arrival" PDF/CSV reports.
-Sellers may upload new reports (PDF or CSV) which the backend parses,
-normalizes (Rs/quintal → Rs/kg) and de-duplicates on
-(commodity, market, market_date).  Unparseable rows are never dropped
-silently — they surface in the ingest report. Everything runs as the demo
-seller identity (the auth layer has been removed).
-"""
+"""Market signals backed by the Redis commodity REST feed."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
 
-from app_pages.api_helpers import (
-    _api_get,
-    _api_post,
-    _api_upload,
-    current_seller,
-    material_symbol,
-)
+from app_pages.api_helpers import _api_get
+from app_pages.ui import page_header
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def _load_commodities() -> Dict[str, Any]:
-    resp = _api_get("/api/market/commodities")
-    if not resp or not resp.get("ok"):
-        return {"groups": [], "markets": []}
-    return resp.get("data", {})
+def _price_history(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return the APMC reference days and live price for charting."""
+    return [
+        {"Period": "Day 1", "Price (₹/kg)": float(product.get("day1_price") or 0.0)},
+        {"Period": "Day 2", "Price (₹/kg)": float(product.get("day2_price") or 0.0)},
+        {
+            "Period": "Live",
+            "Price (₹/kg)": float(
+                product.get("dynamic_price") or product.get("day2_price") or 0.0
+            ),
+        },
+    ]
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def _load_series(commodity: str, market: Optional[str]) -> List[Dict[str, Any]]:
-    params = {"commodity": commodity}
-    if market:
-        params["market"] = market
-    resp = _api_get("/api/market/series", params)
-    if not resp or not resp.get("ok"):
-        return []
-    return resp.get("data", [])
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def _load_prices(**kwargs) -> List[Dict[str, Any]]:
-    resp = _api_get("/api/market/prices", kwargs.get("params", {}))
-    if not resp or not resp.get("ok"):
-        return []
-    return resp.get("data", [])
-
-
+@st.fragment(run_every=3)
 def _render_public() -> None:
-    data = _load_commodities()
-    groups = data.get("groups", [])
-    markets = data.get("markets", []) or ["National Aggregate"]
-
-    flat_commodities = sorted({c["commodity"] for g in groups for c in _all_commodities(g)})
-    if not flat_commodities:
-        st.info(
-            f"{material_symbol('info')}  No market data yet. "
-            "Ask a seller to upload a Marketwise Price & Arrival report."
+    """Show the live market comparison from the currently supported endpoint."""
+    response = _api_get("/api/products", ttl=3)
+    products = (response or {}).get("data") or []
+    if not products:
+        st.warning(
+            "Market feed unavailable. Confirm Flask is running on port 5000 "
+            "and Redis is available on port 6379."
         )
         return
 
-    c_col, m_col = st.columns([2, 1])
-    with c_col:
-        commodity = st.selectbox("Commodity", flat_commodities)
-    with m_col:
-        market = st.selectbox("Market", markets)
+    st.caption(
+        f"Live Redis market feed · {len(products)} commodities · refreshes every 3 seconds"
+    )
+    categories = sorted(
+        {str(product.get("category") or "Other") for product in products}
+    )
+    filter_col, commodity_col = st.columns([1, 2])
+    with filter_col:
+        category = st.selectbox(
+            "Category",
+            ["All categories", *categories],
+            key="market_signal_category",
+        )
 
-    rows = _load_series(commodity, market)
+    filtered_products = [
+        product
+        for product in products
+        if category == "All categories" or product.get("category") == category
+    ]
+    with commodity_col:
+        selected_id = st.selectbox(
+            "Commodity",
+            [str(product["id"]) for product in filtered_products],
+            format_func=lambda value: next(
+                str(product.get("name", value))
+                for product in filtered_products
+                if str(product["id"]) == value
+            ),
+            key="market_signal_product",
+        )
 
-    if not rows:
-        st.warning(f"No series found for {commodity}.")
-        return
-
-    days = [r["market_date"] for r in rows]
-    prices = [r["price_per_kg"] for r in rows]
-    msps = [r["msp_per_kg"] for r in rows]
-    arrivals = [r["arrival_metric_tonnes"] or 0 for r in rows]
-
-    latest = rows[-1]
-    prev = rows[-2] if len(rows) > 1 else None
-    price_delta = None
-    if prev and prev.get("price_per_kg") is not None and latest.get("price_per_kg"):
-        price_delta = latest["price_per_kg"] - prev["price_per_kg"]
+    product = next(
+        item for item in filtered_products if str(item["id"]) == selected_id
+    )
+    day1 = float(product.get("day1_price") or 0.0)
+    day2 = float(product.get("day2_price") or 0.0)
+    dynamic = float(product.get("dynamic_price") or day2)
+    day_trend = ((day2 - day1) / day1 * 100.0) if day1 else 0.0
+    price_change = float(product.get("price_change_pct") or 0.0)
 
     with st.container(horizontal=True):
-        st.metric("Price (₹/kg)", f"{latest['price_per_kg']:.2f}" if latest.get("price_per_kg") is not None else "—",
-                  delta=f"{price_delta:+.2f}" if price_delta is not None else None, border=True)
-        st.metric("MSP (₹/kg)", f"{latest['msp_per_kg']:.2f}" if latest.get("msp_per_kg") is not None else "—", border=True)
-        vs = latest.get("vs_msp_pct")
-        st.metric("vs MSP", f"{vs:+.1f}%" if vs is not None else "—", border=True)
-        st.metric("Arrival (MT)", f"{latest['arrival_metric_tonnes']:,.1f}" if latest.get("arrival_metric_tonnes") is not None else "—", border=True)
-        st.metric("Date", latest["market_date"], border=True)
-
-    chart_l, chart_r = st.columns(2)
-    with chart_l:
-        df = pd.DataFrame({"date": days, "price": prices, "msp": msps})
-        st.line_chart(df.set_index("date"))
-        st.caption(f"{material_symbol('show_chart')}  Price vs MSP — {commodity} ({market})")
-    with chart_r:
-        df2 = pd.DataFrame({"date": days, "arrival_mt": arrivals})
-        st.bar_chart(df2.set_index("date"), height=300)
-        st.caption(f"{material_symbol('co2')}  Arrival (metric tonnes)")
-
-    st.space("small")
-    with st.expander(f"{material_symbol('table')}  Recent market records"):
-        st.dataframe(
-            pd.DataFrame(_load_prices(params={"commodity": commodity})),
-            hide_index=True,
-            use_container_width=True,
+        st.metric(
+            "APMC market price",
+            f"₹{day2:,.2f}/kg",
+            delta=f"{day_trend:+.1f}% vs Day 1",
+            border=True,
+        )
+        st.metric(
+            "Dynamic price",
+            f"₹{dynamic:,.2f}/kg",
+            delta=f"{price_change:+.1f}%",
+            border=True,
+        )
+        st.metric(
+            "Stock available",
+            f"{float(product.get('stock_kg') or 0.0):,.1f} kg",
+            border=True,
         )
 
+    chart_col, detail_col = st.columns([1.5, 1])
+    with chart_col:
+        with st.container(border=True):
+            st.subheader("Price movement")
+            history = pd.DataFrame(_price_history(product))
+            st.line_chart(
+                history,
+                x="Period",
+                y="Price (₹/kg)",
+                color="#287D58",
+            )
+            st.caption(
+                f"{product.get('name', 'Commodity')} · "
+                f"{product.get('category', 'Other')}"
+            )
+    with detail_col:
+        with st.container(border=True):
+            st.subheader("Market snapshot")
+            st.metric("Day 1 reference", f"₹{day1:,.2f}/kg")
+            st.metric("Day 2 reference", f"₹{day2:,.2f}/kg")
+            st.badge(
+                "Rate clamped" if product.get("capped") else "Within price band",
+                icon=(
+                    ":material/warning:"
+                    if product.get("capped")
+                    else ":material/check_circle:"
+                ),
+                color="orange" if product.get("capped") else "green",
+            )
 
-def _all_commodities(group: Dict[str, Any]) -> List[Dict[str, str]]:
-    return [{"commodity": c} for c in group.get("commodities", [])]
-
-
-def _render_seller_ingest() -> None:
-    st.divider()
-    st.subheader(f"{material_symbol('upload')}  Upload a Marketwise report (sellers)")
-    st.caption(
-        "PDF from agmarknet.gov.in or a CSV.  Rows are normalized to ₹/kg "
-        "and de-duplicated on commodity + market + date."
-    )
-
-    upload_col, info_col = st.columns([1, 2])
-    with upload_col:
-        uploaded = st.file_uploader("Choose report", type=["pdf", "csv", "txt"])
-        if uploaded is not None:
-            if st.button(
-                f"{material_symbol('cloud_upload')}  Ingest report",
-                type="primary",
-                width="stretch",
-            ):
-                with st.spinner("Parsing and ingesting…"):
-                    resp = _api_upload(
-                        "/api/market/ingest",
-                        uploaded.name,
-                        uploaded.getvalue(),
-                    )
-                if resp and resp.get("ok"):
-                    j = resp["data"]
-                    st.success(
-                        f"Ingested {j['ingested']['inserted']} new, "
-                        f"{j['ingested']['updated']} updated, "
-                        f"{j['ingested']['skipped']} duplicate rows."
-                    )
-                    if j["parsed"]["errors"] or j["ingested"]["errors"]:
-                        st.warning(
-                            f"{j['parsed']['errors']}|{j['ingested']['errors']} "
-                            "rows could not be parsed — shown below."
-                        )
-                        for e in (j.get("error_rows") or [])[:10]:
-                            st.caption(
-                                f"⚠️ {e.get('reason', '')} — `{e.get('raw_text', '')[:120]}`"
-                            )
-                    st.caption(
-                        f"Report date: {j['parsed'].get('report_date')} · "
-                        f"Generated: {j['parsed'].get('generated_at')}"
-                    )
-                    st.cache_data.clear()
-                else:
-                    st.error((resp or {}).get("error", "Ingest failed.")
-                             if resp else "Ingest failed.")
-
-    with info_col:
-        resp = _api_get("/api/market/status")
-        if resp and resp.get("ok"):
-            stats = resp["data"].get("stats", {})
-            if stats:
-                with st.container(horizontal=True):
-                    st.metric("Total records", stats.get("total_records", 0), border=True)
-                    st.metric("Real", stats.get("real", 0), border=True)
-                    st.metric("Synthetic", stats.get("synthetic", 0), border=True)
-                    st.metric("Latest date", stats.get("latest_market_date") or "—", border=True)
-            with st.expander("Recent ingests"):
-                for log_entry in resp["data"].get("recent_ingests", []):
-                    st.caption(
-                        f"`{log_entry.get('ingested_at', '')[:19]}`  "
-                        f"source={log_entry.get('source')}  "
-                        f"+{log_entry.get('inserted', 0)} new / "
-                        f"~{log_entry.get('skipped', 0)} dup / "
-                        f"⚠{log_entry.get('errors', 0)} err"
-                    )
+    with st.expander("Compare all commodities"):
+        st.dataframe(
+            [
+                {
+                    "Commodity": item.get("name", "Unknown"),
+                    "Category": item.get("category", "Other"),
+                    "Day 1 (₹/kg)": float(item.get("day1_price") or 0.0),
+                    "Day 2 (₹/kg)": float(item.get("day2_price") or 0.0),
+                    "Live (₹/kg)": float(
+                        item.get("dynamic_price") or item.get("day2_price") or 0.0
+                    ),
+                    "Movement": f"{float(item.get('price_change_pct') or 0.0):+.1f}%",
+                }
+                for item in filtered_products
+            ],
+            hide_index=True,
+            width="stretch",
+        )
 
 
 def app() -> None:
-    st.title(f"{material_symbol('monitoring')}  Market Prices & Arrival")
-    st.caption('Agmarknet "Marketwise Price & Arrival" feeds — normalized to ₹/kg.')
-
-    user = current_seller()
-    if user:
-        st.toggle(
-            "Seller tools: upload reports & view ingest status",
-            key="market_seller_tools",
+    page_header(
+        "Market signals",
+        "Read the price beneath the price.",
+        "Compare APMC reference prices with live, demand-adjusted market prices.",
+        ":material/query_stats:",
+    )
+    section = st.segmented_control(
+        "Market data view",
+        ["Price explorer", "Report uploads"],
+        default="Price explorer",
+        key="market_prices_view",
+        label_visibility="collapsed",
+    )
+    if section == "Report uploads":
+        st.info(
+            "Market report uploads and MSP/arrival history are not available in "
+            "the current Phase 2 REST backend. The live commodity price explorer "
+            "uses the supported Redis-backed feed."
         )
-        if st.session_state.get("market_seller_tools"):
-            _render_seller_ingest()
+        return
 
     _render_public()

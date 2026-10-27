@@ -63,6 +63,12 @@ class Config:
         os.getenv("AUTO_DOWNLOAD_NLP_MODEL", ""), default=True
     )
 
+    # --- Redis (Phase 1 data layer) ----------------------------------------
+    REDIS_URI: str = "redis://127.0.0.1:6379/0"
+    APMC_CSV_PATH: str = os.getenv(
+        "APMC_CSV_PATH", str(BASE_DIR / "data" / "apmc_2day.csv")
+    )
+
     # --- Twilio ---------------------------------------------------------------
     TWILIO_ENABLED: bool = _as_bool(os.getenv("TWILIO_ENABLED", ""), default=False)
     TWILIO_ACCOUNT_SID: str = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -70,7 +76,7 @@ class Config:
     TWILIO_FROM_NUMBER: str = os.getenv("TWILIO_FROM_NUMBER", "")
 
     # --- Consumers -------------------------------------------------------------
-    API_BASE_URL: str = os.getenv("API_BASE_URL", "http://localhost:5000")
+    API_BASE_URL: str = "http://127.0.0.1:5000"
 
     @classmethod
     def effective_database_uri(cls) -> str:
