@@ -4,7 +4,7 @@ from flask import Flask
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
-from api.routes import api_bp
+from api.routes import MAX_MARKET_REPORT_BYTES, api_bp
 from api.socketio_events import register_socketio_handlers
 from api.dashboard import dashboard_bp
 from config import Config
@@ -20,6 +20,7 @@ def create_app(test_config: dict | None = None):
         SECRET_KEY=Config.SECRET_KEY,
         DATABASE_URI=Config.MONGO_URI or "mongomock://localhost",
         SQL_ECHO=Config.SQL_ECHO,
+        MAX_CONTENT_LENGTH=MAX_MARKET_REPORT_BYTES + 1024 * 1024,
     )
     if test_config:
         app.config.update(test_config)

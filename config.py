@@ -23,7 +23,10 @@ class Config:
     # --- Core server -------------------------------------------------------
     SECRET_KEY: str = os.getenv("SECRET_KEY", "change-me-in-production")
     DEBUG: bool = _as_bool(os.getenv("DEBUG", ""), default=False)
-    HOST: str = os.getenv("HOST", "0.0.0.0")
+    # Loopback-only binding (phase_integration_specification.md §Phase 1).
+    HOST: str = os.getenv(
+        "AGRITECH_HOST", os.getenv("HOST", "127.0.0.1")
+    )
     PORT: int = int(os.getenv("PORT", "5000"))
     SQL_ECHO: bool = _as_bool(os.getenv("SQL_ECHO", ""), default=False)
 
@@ -76,7 +79,10 @@ class Config:
     TWILIO_FROM_NUMBER: str = os.getenv("TWILIO_FROM_NUMBER", "")
 
     # --- Consumers -------------------------------------------------------------
-    API_BASE_URL: str = "http://127.0.0.1:5000"
+    API_BASE_URL: str = os.getenv(
+        "AGRITECH_API_BASE_URL",
+        os.getenv("API_BASE_URL", "http://127.0.0.1:5000"),
+    ).rstrip("/")
 
     @classmethod
     def effective_database_uri(cls) -> str:

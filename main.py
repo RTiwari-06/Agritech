@@ -1,13 +1,20 @@
-"""Framework entrypoint: Flask + SocketIO server.
+"""Agritech REST engine entrypoint — Redis + Flask + SocketIO (spec §1).
+
+Network interfaces (phase_integration_specification.md §Phase 1):
+    * Redis  127.0.0.1:6379 (DB 0, RESP2 protocol)
+    * Flask  127.0.0.1:5000 (REST + Socket.IO)
 
 Run:
     python main.py
 
 Then launch the Streamlit frontend in a second terminal:
     streamlit run frontend/app.py
+
+The engine self-seeds from the default APMC PDF report the first time it
+boots against an empty Redis; the remaining data flows are Redis-backed
+(product Hashes, streams Set/Hashes, chat Lists, order receipts).
 """
 
-import os
 import sys
 
 # Silence Windows asyncio ProactorBasePipeTransport socket shutdown tracebacks on connection lost
@@ -27,64 +34,46 @@ if sys.platform == "win32":
 
 from api.app import create_app
 from config import Config
-from database.db import get_db
 from database.pdf_seeder import default_pdf_path, seed_redis
-from database.redis_db import get_all_products
+from database.redis_db import (
+    get_all_products,
+    get_client,
+    seed_default_stream,
+)
 from redis.exceptions import RedisError
-from seed_data import reset_and_seed
 
-# Auto-seed on first run if the DB is empty (mongomock = in-process,
-# so a separate seed script can't share data with the server).
-_db = get_db()
-_users = _db["users"]
-_total_users = _users.count_documents({})
-if _total_users == 0:
-    print(f"Auto-seeding demo data on startup (users={_total_users})...")
-    reset_and_seed()
-    print(
-        f"DEBUG after seed — "
-        f"users={_db['users'].count_documents({})}, "
-        f"products={_db['products'].count_documents({})}, "
-        f"orders={_db['orders'].count_documents({})}, "
-        f"streams={_db['live_streams'].count_documents({})}, "
-        f"reviews={_db['reviews'].count_documents({})}, "
-        f"messages={_db['chat_messages'].count_documents({})}, "
-        f"counters={_db['_counters'].count_documents({})}"
-    )
-    print(f"DEBUG first_user={_db['users'].find_one()}")
-    print(f"DEBUG first_product={_db['products'].find_one()}")
-else:
-    print(
-        f"Using existing data in MongoDB ({_total_users} users)."
-    )
 
-try:
-    _redis_products = get_all_products()
-except RedisError as exc:
-    print(
-        "WARNING: Redis at 127.0.0.1:6379 is unavailable; starting Flask "
-        f"without Redis-backed data: {exc}"
-    )
-    _redis_products = []
-    _redis_available = False
-else:
-    _redis_available = True
-
-if _redis_available and not _redis_products:
+def _bootstrap_redis() -> None:
+    """Verify Redis reachability, seed APMC commodities if empty, and make
+    sure the default live stream exists (spec §3.2/§3.3)."""
     try:
-        _seeded_products = seed_redis([default_pdf_path()], flush_db=False)
+        client = get_client()
+        client.ping()
     except RedisError as exc:
-        print(f"WARNING: Could not seed Redis products: {exc}")
-    else:
-        print(f"Seeded {_seeded_products} APMC commodities into Redis.")
-else:
-    if _redis_products:
-        print(f"Using {len(_redis_products)} existing Redis commodities.")
+        print(
+            "WARNING: Redis at 127.0.0.1:6379 is unavailable; the product, "
+            f"stream, chat, and order endpoints will report failures: {exc}"
+        )
+        return
+
+    try:
+        products = get_all_products()
+        if not products:
+            seeded = seed_redis([default_pdf_path()], flush_db=False)
+            print(f"Redis empty — seeded {seeded} APMC commodities from the default report.")
+        else:
+            print(f"Using {len(products)} existing Redis commodities.")
+        seed_default_stream(client)
+    except RedisError as exc:
+        print(f"WARNING: Redis bootstrap seeding failed: {exc}")
+
 
 app, socketio = create_app()
 
 
 if __name__ == "__main__":
+    _bootstrap_redis()
+    print(f"Flask REST engine listening on http://{Config.HOST}:{Config.PORT}")
     socketio.run(
         app,
         host=Config.HOST,

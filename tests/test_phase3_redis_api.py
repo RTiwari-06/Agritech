@@ -34,6 +34,48 @@ def _product(
     }
 
 
+class _FakeNlp:
+    """Stub NL engine shared by the chat-route tests."""
+
+    @staticmethod
+    def analyze_sentiment(message: str) -> dict:
+        return {"sentiment_score": 0.8, "sentiment_label": "POSITIVE"}
+
+    @staticmethod
+    def detect_intent(message: str) -> str:
+        return "QUALITY_INQUIRY"
+
+
+def test_order_route_defaults_to_demo_buyer(client, monkeypatch):
+    """Spec §Phase 3.5 — buyer_id is optional in the required payload."""
+    import api.routes as routes
+
+    product = _product()
+    persisted = {}
+    monkeypatch.setattr(routes, "get_product", lambda product_id: product)
+    monkeypatch.setattr(routes, "_priced_products", lambda: [product])
+    monkeypatch.setattr(
+        routes,
+        "create_redis_order",
+        lambda product_id, quantity_kg, buyer_id, price_per_kg, order_id: (
+            persisted.update(
+                product_id=product_id, buyer_id=buyer_id, quantity_kg=quantity_kg
+            )
+            or "created",
+            98.0,
+        ),
+    )
+
+    response = client.post(
+        "/api/orders",
+        json={"product_id": "7", "quantity_kg": 2.0},
+    )
+
+    assert response.status_code == 201
+    assert persisted["buyer_id"] == "demo_buyer"
+    assert persisted["product_id"] == "7"
+
+
 def test_order_route_persists_receipt_and_remaining_stock(client, monkeypatch):
     import api.routes as routes
 
@@ -236,6 +278,58 @@ def test_seller_update_writes_supported_product_fields(client, monkeypatch):
     assert updates == {"stock_kg": 250.0, "day2_price": 10.0, "capped": "true"}
     assert response.get_json()["data"]["dynamic_price"] == 10
     assert response.get_json()["data"]["capped"] is True
+
+
+def test_chat_post_persists_recalculated_dynamic_price(client, monkeypatch):
+    """Phase 3.4 — chat ingestion writes the recalculated price to the Hash."""
+    import api.routes as routes
+
+    persisted = {}
+    product = _product(day2_price=10.0, stock_kg=500.0)
+    monkeypatch.setattr(routes, "_chat_nlp", _FakeNlp())
+    monkeypatch.setattr(routes, "push_chat_message", lambda message: None)
+    monkeypatch.setattr(routes, "get_all_products", lambda: [product])
+    monkeypatch.setattr(routes, "get_recent_chats", lambda limit: [])
+    monkeypatch.setattr(
+        routes,
+        "update_product_fields",
+        lambda product_id, fields: persisted.update(
+            product_id=product_id, fields=fields
+        )
+        or True,
+    )
+
+    response = client.post(
+        "/api/streams/chats",
+        json={"product_id": "7", "message": "Need 500kg onions immediately!"},
+    )
+
+    assert response.status_code == 201
+    assert persisted["product_id"] == "7"
+    assert persisted["fields"]["capped"] in ("true", "false")
+    assert persisted["fields"]["dynamic_price"] >= 10.0
+
+
+def test_chat_signals_prefers_product_scoped_window():
+    """Spec §2.2 — V is averaged over the product's own chat window."""
+    import api.routes as routes
+
+    chats = [
+        {"product_id": "17", "sentiment_score": 0.8},
+        {"product_id": "17", "sentiment_score": -0.4},
+        {"product_id": "9", "sentiment_score": -0.9},
+    ]
+    avg_product, engagement_product = routes._chat_signals(chats, product_id="17")
+    assert avg_product == pytest.approx(0.2)
+    assert 0.0 <= engagement_product <= 1.0
+
+    # A commodity without its own messages falls back to the shared feed.
+    avg_fallback, _ = routes._chat_signals(chats, product_id="42")
+    assert avg_fallback == pytest.approx((0.8 - 0.4 - 0.9) / 3)
+
+    avg_empty, engagement_empty = routes._chat_signals([], product_id="17")
+    assert avg_empty == 0.0
+    assert engagement_empty is None
 
 
 def test_dynamic_pricing_obeys_phase3_bounds_and_manual_clamp():

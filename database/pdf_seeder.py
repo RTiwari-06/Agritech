@@ -18,7 +18,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from database.redis_db import PRODUCT_KEY_PREFIX, get_client  # noqa: E402
+from database.redis_db import (  # noqa: E402
+    PRODUCT_KEY_PREFIX,
+    get_client,
+    seed_default_stream,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +332,9 @@ def seed_redis(pdf_paths: Sequence[Path], flush_db: bool = False) -> int:
                 row["name"],
                 exc,
             )
+    # Spec §3.2/§3.3 + §5: seed the default live-stream fallback so
+    # GET /api/streams is never empty after a report re-seed.
+    seed_default_stream(client)
     return seeded
 
 
@@ -340,7 +347,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (OSError, ValueError, PdfReadError, RedisError) as exc:
         logger.error("APMC seeding failed: %s", exc)
         return 1
-    print(f"Successfully seeded {seeded} commodities into Redis.")
+    print(
+        f"Successfully seeded {seeded} products and stream defaults into Redis."
+    )
     return 0 if seeded else 1
 
 

@@ -232,11 +232,13 @@ def test_runtime_engine_live_factor():
     from optimization.engine import DynamicPricingEngine as RuntimeEngine
 
     engine = RuntimeEngine()
+    # S = S_ref (500 kg) keeps the §2.3 scarcity multiplier at exactly 1.0, so
+    # the live nudge stays inside [0.85, 1.25] × base and can be observed.
     neutral = engine.calculate_optimal_price(
-        product_id=1, base_price=10.0, demand_factor=0.5, stock_kg=100.0
+        product_id=1, base_price=10.0, demand_factor=0.5, stock_kg=500.0
     )
     boosted = engine.calculate_optimal_price(
-        product_id=1, base_price=10.0, demand_factor=0.5, stock_kg=100.0,
+        product_id=1, base_price=10.0, demand_factor=0.5, stock_kg=500.0,
         live_engagement=1.0,
     )
     assert neutral.live_factor == 0.0

@@ -1,5 +1,7 @@
 """Focused tests for the active Redis-backed REST API."""
 
+from io import BytesIO
+
 import pytest
 from flask import Flask
 
@@ -73,6 +75,79 @@ def test_redis_products_returns_dynamic_price_fields(client, monkeypatch):
         "stock_kg",
         "capped",
     }.issubset(rows[0])
+
+
+def test_market_report_upload_parses_and_persists_csv(client, monkeypatch):
+    import api.routes as routes
+
+    saved_records = []
+
+    def store_records(records):
+        saved_records.extend(records)
+        return {"inserted": len(records), "updated": 0}
+
+    monkeypatch.setattr(routes, "store_market_records", store_records)
+    response = client.post(
+        "/api/market-prices/upload",
+        data={
+            "file": (
+                BytesIO(
+                    b"commodity,market,date,price_per_kg,msp_per_kg,arrival_metric_tonnes\n"
+                    b"Tomato,Bengaluru,2026-10-25,20,15,12\n"
+                ),
+                "report.csv",
+            )
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 201
+    assert response.get_json()["data"]["rows_parsed"] == 1
+    assert saved_records[0]["market_date"] == "2026-10-25"
+    assert saved_records[0]["msp_per_kg"] == 15.0
+    assert saved_records[0]["arrival_metric_tonnes"] == 12.0
+
+
+def test_market_report_upload_rejects_unusable_rows_without_writing(client, monkeypatch):
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        routes,
+        "store_market_records",
+        lambda records: pytest.fail("unusable rows must not be stored"),
+    )
+    response = client.post(
+        "/api/market-prices/upload",
+        data={
+            "file": (
+                BytesIO(b"commodity,market,date,price_per_kg\nTomato,Bengaluru,invalid,\n"),
+                "report.csv",
+            )
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert "No usable" in response.get_json()["error"] or "unparseable" in response.get_json()["error"]
+
+
+def test_market_history_endpoint_passes_filters_and_limit(client, monkeypatch):
+    import api.routes as routes
+
+    captured = {}
+
+    def get_records(commodity=None, market=None, limit=500):
+        captured.update(commodity=commodity, market=market, limit=limit)
+        return [{"commodity": commodity, "market": market, "market_date": "2026-10-25"}]
+
+    monkeypatch.setattr(routes, "get_market_records", get_records)
+    response = client.get(
+        "/api/market-prices?commodity=Tomato&market=Bengaluru&limit=5"
+    )
+
+    assert response.status_code == 200
+    assert captured == {"commodity": "Tomato", "market": "Bengaluru", "limit": 5}
+    assert len(response.get_json()["data"]) == 1
 
 
 def test_redis_chat_accepts_product_message_payload(client, monkeypatch):

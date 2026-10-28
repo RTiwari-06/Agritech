@@ -1,11 +1,12 @@
 """Shared helpers for all Agritech pages.
 
-Covers: HTTP helpers (with caching), rendering primitives (native badges,
-material symbols, product cards, charts), and skeleton placeholders (#4).
+Covers: HTTP helpers (with caching), material symbols, and chart/skeleton
+rendering primitives for the Redis-backed pages (see
+``phase_integration_specification.md`` §Phase 2 — all reads go through
+``_api_get``/``_api_post``/``_api_put`` against the configured REST endpoint).
 
 Improvements covered here:
   #1  Caching — @st.cache_data on read-only API GETs
-  #6  Native st.badge helpers — drop unsafe_allow_html badges
   #7  Material Symbols — a couple of centrally useful symbols
 """
 
@@ -14,10 +15,10 @@ from __future__ import annotations
 import sys
 import http.client
 import json
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, cast
 
@@ -29,21 +30,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-API_BASE_URL: str = "http://127.0.0.1:5000"
+from config import Config
+
+API_BASE_URL: str = Config.API_BASE_URL
 BASE_URL = API_BASE_URL
-
-
-class C:
-    API_BASE_URL: str = "http://127.0.0.1:5000"
-
-
-try:
-    from config import Config
-except Exception:
-    Config = C
-else:
-    Config.API_BASE_URL = API_BASE_URL
-
 
 BadgeColor = Literal[
     "red", "orange", "yellow", "blue", "green", "violet", "gray", "grey", "primary"
@@ -52,15 +42,12 @@ BadgeColor = Literal[
 
 def _api_base_url() -> str:
     """Return the API base URL, reading fresh from Config each call."""
-    return getattr(Config, "API_BASE_URL", BASE_URL).rstrip("/")
+    return Config.API_BASE_URL.rstrip("/")
 
 
 # ---------------------------------------------------------------------------
 # Configuration & helpers
 # ---------------------------------------------------------------------------
-
-_API = _api_base_url()
-
 
 # Material Symbols icon shorthand — central registry of icons the app uses
 MATERIAL_SYMBOLS: Dict[str, str] = {
@@ -125,7 +112,7 @@ def material_symbol(name: str, fallback: str = "circle") -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers + demo identities (auth layer removed)
+# HTTP helpers (the Redis REST engine is public — no auth layer)
 # ---------------------------------------------------------------------------
 
 def _http_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -133,50 +120,6 @@ def _http_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     if extra:
         headers.update(extra)
     return headers
-
-
-def _ensure_identities() -> bool:
-    """Fetch the user directory once and pin the demo seller/buyer identities.
-
-    Returns ``False`` when the backend is unreachable (the caller should show a
-    connection error and stop).
-    """
-
-    @st.cache_data(ttl=30, show_spinner=False)
-    def _directory() -> Optional[list]:
-        resp = _api_get("/api/users", ttl=30)
-        if not resp or not resp.get("ok"):
-            return None
-        return resp.get("data")
-
-    if "demo_seller" not in st.session_state:
-        st.session_state.demo_seller = None
-    if "demo_buyer" not in st.session_state:
-        st.session_state.demo_buyer = None
-
-    if st.session_state.demo_seller or st.session_state.demo_buyer:
-        return True
-
-    users = _directory()
-    if users is None:
-        return False
-    st.session_state.demo_seller = next(
-        (u for u in users if u.get("role") == "seller"), None
-    )
-    st.session_state.demo_buyer = next(
-        (u for u in users if u.get("role") == "buyer"), None
-    )
-    return True
-
-
-def current_user() -> Optional[Dict[str, Any]]:
-    """Demo buyer identity — the user behind every buyer-side action."""
-    return st.session_state.get("demo_buyer")
-
-
-def current_seller() -> Optional[Dict[str, Any]]:
-    """Demo seller identity — the user behind every seller-side action."""
-    return st.session_state.get("demo_seller")
 
 
 def _api_get(
@@ -245,6 +188,46 @@ def _api_post(
         return None
 
 
+def _api_upload(
+    path: str,
+    filename: str,
+    content: bytes,
+) -> Optional[Dict[str, Any]]:
+    """POST a file using multipart form data, preserving backend error payloads."""
+    url = f"{_api_base_url()}{path}"
+    boundary = f"----Agritech{uuid.uuid4().hex}"
+    safe_filename = Path(filename.replace("\\", "/")).name
+    safe_filename = "".join(
+        character for character in safe_filename
+        if character.isprintable() and character not in {'"', "\\"}
+    )
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{safe_filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8") + content + f"\r\n--{boundary}--\r\n".encode("ascii")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers=_http_headers({"Content-Type": f"multipart/form-data; boundary={boundary}"}),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except (ValueError, OSError):
+            return {"ok": False, "error": f"HTTP {exc.code}"}
+    except http.client.HTTPException as exc:
+        print(f"[api_helpers] {path} returned an invalid HTTP response: {exc}")
+        return None
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"[api_helpers] {path} error: {exc}")
+        return None
+
+
 def _api_put(
     path: str,
     data: Dict[str, Any],
@@ -273,239 +256,9 @@ def _api_put(
         return None
 
 
-def _api_upload(
-    path: str, filename: str, file_bytes: bytes, extra: Optional[Dict[str, Any]] = None
-) -> Optional[Dict[str, Any]]:
-    """Multipart POST for market-report uploads (PDF/CSV)."""
-    boundary = "----AgritechBoundary" + uuid.uuid4().hex
-    body_parts = []
-    if extra:
-        for key, value in extra.items():
-            body_parts.append(
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'
-            )
-    body_parts.append(
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-        f"Content-Type: application/octet-stream\r\n\r\n"
-    )
-    body = "".join(body_parts).encode("utf-8") + file_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
-    req = urllib.request.Request(
-        f"{_API}{path}",
-        data=body,
-        headers=_http_headers({
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        }),
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            return json.loads(exc.read().decode("utf-8"))
-        except (ValueError, OSError):
-            return {"ok": False, "error": f"HTTP {exc.code}"}
-    except http.client.HTTPException as exc:
-        print(f"[api_helpers] {path} upload returned an invalid HTTP response: {exc}")
-        return None
-    except (urllib.error.URLError, OSError) as exc:
-        print(f"[api_helpers] {path} upload error: {exc}")
-        return None
-
-
 # ---------------------------------------------------------------------------
-# #6  Native st.badge helpers — no unsafe_allow_html needed
+# Shared rendering helpers — charts and skeletons
 # ---------------------------------------------------------------------------
-
-def badge_sentiment(sentiment: str, delta: float = 0.0) -> None:
-    icon_map = {
-        "NEGATIVE": "sentiment_very_dissatisfied",
-        "NEUTRAL": "sentiment_neutral",
-        "POSITIVE": "sentiment_satisfied",
-    }
-    color_map = {
-        "NEGATIVE": "red",
-        "NEUTRAL": "grey",
-        "POSITIVE": "green",
-    }
-    icon = icon_map.get(sentiment, fallback_name(sentiment))
-    color = color_map.get(sentiment, "grey")
-    st.badge(
-        label=f"{sentiment}  ({delta:+.1%})",
-        icon=f":material/{icon}:",
-        color=cast(BadgeColor, color),
-    )
-
-
-def badge_status(text: str, color: str = "blue", icon: str = "info") -> None:
-    st.badge(label=text, icon=f":material/{icon}:", color=cast(BadgeColor, color))
-
-
-def badge_trend(direction: float, suffix: str = "%") -> None:
-    delta = float(direction)
-    color = "green" if delta > 0 else ("red" if delta < 0 else "gray")
-    icon = "trending_up" if delta > 0 else ("trending_down" if delta < 0 else "trending_flat")
-    st.badge(
-        label=f"{'+' if delta > 0 else ''}{delta:.1f}{suffix}",
-        icon=f":material/{icon}:",
-        color=cast(BadgeColor, color),
-    )
-
-
-def badge_rating(rating: float) -> None:
-    icon = "star" if rating > 0 else "star_outline"
-    color = "green" if rating >= 4.0 else ("orange" if rating >= 3.0 else "gray")
-    st.badge(
-        label=f"{rating:.1f} / 5.0",
-        icon=f":material/{icon}:",
-        color=cast(BadgeColor, color),
-    )
-
-
-def fallback_name(name: str) -> str:
-    """Pick a reasonable material-equivalent when exact name unknown."""
-    aliases = {
-        "live_tv": "live_tv",
-        "trending_up": "trending_up",
-        "trending_down": "trending_down",
-        "star": "star",
-        "star_outline": "star_outline",
-        "warning": "warning",
-        "info": "info",
-        "cancel": "cancel",
-        "check_circle": "check_circle",
-        "error": "error",
-        "circle": "circle",
-        "search": "search",
-        "shopping_cart": "shopping_cart",
-        "store": "storefront",
-        "grass": "grass",
-        "analytics": "analytics",
-        "trending_up": "trending_up",
-        "person": "person",
-        "inventory_2": "inventory_2",
-        "currency_rupee": "currency_rupee",
-        "shopping_cart": "shopping_cart",
-        "schedule": "schedule",
-        "local_shipping": "local_shipping",
-        "thumb_up": "thumb_up",
-        "thumb_down": "thumb_down",
-        "chat": "chat",
-        "mic": "mic",
-        "video_camera_front": "video_camera_front",
-        "live_tv": "live_tv",
-        "refresh": "refresh",
-        "support_agent": "support_agent",
-        "mood": "mood",
-        "sentiment_very_dissatisfied": "sentiment_very_dissatisfied",
-        "sentiment_satisfied": "sentiment_satisfied",
-        "sentiment_neutral": "sentiment_neutral",
-        "arrow_drop_down": "arrow_drop_down",
-        "arrow_drop_up": "arrow_drop_up",
-        "precision_manufacturing": "precision_manufacturing",
-        "business_center": "business_center",
-        "eco": "leaf",
-    }
-    return aliases.get(name, "circle")
-
-
-# ---------------------------------------------------------------------------
-# Shared rendering helpers — product cards, charts, skeletons
-# ---------------------------------------------------------------------------
-
-
-def product_card_row(product: Dict[str, Any], index: int) -> None:
-    """Render one product row (native Streamlit — no unsafe_allow_html)."""
-    name = product.get("name") or "Unknown"
-    category = product.get("category") or "—"
-    price = product.get("price") or 0.0
-    stock = product.get("stock_kg") or 0.0
-    rating = product.get("rating") or 0.0
-    live_engagement = product.get("live_engagement")
-    live_boost = product.get("live_price_boost_pct") or 0.0
-    seller_name = product.get("seller", {}).get("username") or "Seller"
-    location = product.get("seller", {}).get("location") or "—"
-    status_key, status_icon, status_color = _stock_status(stock)
-
-    col_img, col_meta, col_price, col_stock, col_action = st.columns(
-        [1.2, 2.2, 1.2, 1.2, 1.4],
-        vertical_alignment="center",
-    )
-
-    with col_img:
-        st.image(
-            "https://img.icons8.com/fluency/96/grass.png",
-            width=48,
-        )
-
-    with col_meta:
-        st.markdown(f"**{name}**", help=f"Category: {category}")
-        st.caption(
-            f"{material_symbol('person')} {seller_name} · "
-            f"{material_symbol('place')} {location} · "
-            f"{material_symbol('tag')} {category}"
-        )
-        st.markdown(f"{material_symbol('star')}  {_stars(rating)}")
-
-    with col_price:
-        st.markdown(f"**₹{price:.2f} / kg**")
-        badge_trend(product.get("price_change_pct") or 0)
-        if live_engagement is not None:
-            st.caption(f"{material_symbol('live_tv')}  Boost {live_boost:+.1f}%")
-
-    with col_stock:
-        st.markdown(f"~{stock:.0f} kg")
-        badge_status(status_key, color=status_color, icon=status_icon)
-
-    with col_action:
-        buyer = current_user()
-        if buyer:
-            def _place_order():
-                buyer_id = buyer.get("id") or buyer.get("username") or "demo_buyer"
-                response = _api_post(
-                    "/api/orders",
-                    {
-                        "product_id": str(product["id"]),
-                        "quantity_kg": 1.0,
-                        "buyer_id": str(buyer_id),
-                    },
-                )
-                if response and response.get("ok"):
-                    st.toast("Order placed; inventory has been updated.")
-                    st.rerun()
-                else:
-                    st.error(
-                        (response or {}).get("error", "Could not place the order.")
-                    )
-
-            st.button(
-                f"{material_symbol('shopping_cart')}  Buy 1 kg as {buyer.get('username', '')}",
-                key=f"buy_{product['id']}_{index}",
-                width="stretch",
-                on_click=_place_order,
-            )
-        else:
-            st.caption("Backend unavailable — restart it to place orders.")
-
-
-def _stock_status(stock_kg: float) -> tuple[str, str, str]:
-    if stock_kg <= 0:
-        return "Out of stock", "cancel", "red"
-    if stock_kg < 50:
-        return "Low stock", "warning", "orange"
-    if stock_kg < 200:
-        return "Limited", "inventory_2", "yellow"
-    return "In stock", "check_circle", "green"
-
-
-def _stars(rating: float) -> str:
-    full = int(rating)
-    half = 1 if (rating - full) >= 0.5 else 0
-    empty = max(5 - full - half, 0)
-    return (":material/star: " * full) + (":material/star_half: " * half) + (":material/star_outline: " * empty)
-
 
 def skeleton_card(label: str = "Loading…") -> None:
     """Native loading skeleton placeholder (#4)."""
@@ -590,24 +343,3 @@ def chart_sentiment_pie(sentiments: Dict[str, int]) -> None:
         font=dict(color="#E8EDF2"),
     )
     st.plotly_chart(fig, theme=None)
-
-
-def _current_user_id() -> Optional[int]:
-    """Return the demo buyer's id, or None when the backend is unreachable."""
-    user = current_user()
-    if user and user.get("id"):
-        return int(user["id"])
-    return None
-
-
-def _current_seller_id() -> Optional[int]:
-    """Return the demo seller's id, or None when the backend is unreachable."""
-    seller = current_seller()
-    if seller and seller.get("id"):
-        return int(seller["id"])
-    return None
-
-
-def _ensure_session_keys() -> None:
-    """Initialise any session_state keys this module expects."""
-    pass

@@ -2,7 +2,6 @@
 
 import sys
 from pathlib import Path
-from typing import Callable
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -12,9 +11,23 @@ import streamlit as st
 
 from app_pages import analytics, market_prices, marketplace, seller_studio
 from app_pages.api_helpers import API_BASE_URL, _api_get
-from config import Config
 
-Config.API_BASE_URL = API_BASE_URL
+
+def _marketplace_page() -> None:
+    marketplace.app()
+
+
+def _market_prices_page() -> None:
+    market_prices.app()
+
+
+def _seller_studio_page() -> None:
+    seller_studio.app()
+
+
+def _analytics_page() -> None:
+    analytics.app()
+
 
 st.set_page_config(
     page_title="Fieldnote · Agritech",
@@ -22,30 +35,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-
-def _render_safely(page_fn: Callable[[], None]) -> None:
-    try:
-        page_fn()
-    except Exception as exc:  # noqa: BLE001 — keep a broken module from taking down the workspace
-        st.info("Module under Phase 2 refactor")
-        st.caption(f"Details: {exc}")
-
-
-def _marketplace_page() -> None:
-    _render_safely(marketplace.app)
-
-
-def _market_prices_page() -> None:
-    _render_safely(market_prices.app)
-
-
-def _seller_studio_page() -> None:
-    _render_safely(seller_studio.app)
-
-
-def _analytics_page() -> None:
-    _render_safely(analytics.app)
 
 
 page = st.navigation(

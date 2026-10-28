@@ -185,19 +185,38 @@ class RecommendationEngine:
 
 
 class DynamicPricingEngine:
-    """Dynamic pricing engine based on demand, stock, and sentiment."""
+    """Dynamic pricing engine — phase_integration_specification.md §2.
+
+    Demand surge multiplier (§2.3)::
+
+        alpha = (S_ref / max(S, 1)) ** gamma * (1 + beta * V)
+
+    where ``S`` is the stock level in kg, ``S_ref = 500 kg`` the nominal
+    reference stock, ``gamma = 0.15`` the scarcity sensitivity exponent and
+    ``beta = 0.20`` the sentiment influence factor (``V`` = mean VADER
+    compound score of the commodity's chat window). The dynamic price is then
+    ``P_raw = P_base * alpha``, safety-clamped into the band
+    ``[0.85 * P_base, 1.25 * P_base]`` (§2.4), with a manual seller clamp
+    pinning the price to ``P_base``.
+    """
 
     def __init__(
         self,
         min_price_ratio: float = 0.85,
         max_price_ratio: float = 1.25,
         stock_high_threshold: float = 500.0,
-        sentiment_boost_max: float = 0.05
+        sentiment_boost_max: float = 0.05,
+        reference_stock_kg: float = 500.0,
+        scarcity_gamma: float = 0.15,
+        sentiment_beta: float = 0.20,
     ) -> None:
         self.min_price_ratio = min_price_ratio
         self.max_price_ratio = max_price_ratio
         self.stock_high_threshold = stock_high_threshold
         self.sentiment_boost_max = sentiment_boost_max
+        self.reference_stock_kg = reference_stock_kg
+        self.scarcity_gamma = scarcity_gamma
+        self.sentiment_beta = sentiment_beta
 
     def calculate_optimal_price(
         self,
@@ -209,8 +228,12 @@ class DynamicPricingEngine:
         live_engagement: Optional[float] = None,
         capped: bool = False,
     ) -> PriceCalculation:
-        """Calculate optimal price using the formula:
-        Optimal Price = Base Price * (1 + Demand Factor - Stock Factor + Sentiment Factor)
+        """Spec §2.2–§2.4: dynamic price from scarcity and chat sentiment.
+
+        ``demand_factor`` and ``live_engagement`` remain accepted for
+        interface compatibility: ``demand_factor`` is echoed back in the
+        result, ``live_engagement`` applies the established ±5% live-market
+        nudge on top of the §2.3 baseline.
         """
         base = max(float(base_price), 0.0)
         if base <= 0:
@@ -225,36 +248,27 @@ class DynamicPricingEngine:
                 capped=capped
             )
 
-        # Demand Factor: 0.0 to 1.0, higher demand -> higher price
-        # Maps to [-0.1, +0.1] range (10% swing)
-        demand_adj = (demand_factor - 0.5) * 0.2
+        # Spec §2.3 — inventory scarcity multiplier: ``max(S, 1)`` guards the
+        # sold-out case, so an empty shelf cannot divide by zero.
+        stock_binding = max(float(stock_kg), 1.0)
+        scarcity_multiplier = (
+            float(self.reference_stock_kg) / stock_binding
+        ) ** float(self.scarcity_gamma)
 
-        # Stock Factor: Higher discount if stock > threshold
-        if stock_kg > self.stock_high_threshold:
-            # Excess stock: discount up to 10%
-            excess_ratio = min(stock_kg / self.stock_high_threshold, 3.0)
-            stock_adj = min(0.1, 0.05 * (excess_ratio - 1.0))
-        elif stock_kg < 50.0:
-            # Low stock: premium up to 10%
-            stock_adj = -min(0.1, 0.05 * (50.0 / max(stock_kg, 1.0)))
-        else:
-            stock_adj = 0.0
+        # Spec §2.3 — VADER chat sentiment influence: V is clipped to [-1, 1].
+        clipped_sentiment = max(-1.0, min(1.0, float(sentiment_score)))
+        sentiment_multiplier = 1.0 + float(self.sentiment_beta) * clipped_sentiment
 
-        # Sentiment Factor: Positive sentiment boosts pricing capability up to 5%
-        # sentiment_score is -1 to 1, map to 0 to 0.05
-        sentiment_adj = max(0.0, sentiment_score) * self.sentiment_boost_max
+        surge_multiplier = scarcity_multiplier * sentiment_multiplier
 
-        # Live-stream engagement factor: chat-driven demand signal, +/-5% swing.
+        # Live-stream engagement nudge: chat-driven demand signal, ±5% swing.
         # None means "no live signal" and stays fully neutral.
         live_adj = 0.0
         if live_engagement is not None:
             live_adj = (max(0.0, min(1.0, float(live_engagement))) - 0.5) * 0.1
+            surge_multiplier *= 1.0 + live_adj
 
-        # Calculate optimal price
-        multiplier = 1.0 + demand_adj - stock_adj + sentiment_adj + live_adj
-        optimal_price = base * multiplier
-
-        # Cap within bounds
+        # Spec §2.4 — P_raw with safety clamping and the manual seller cap.
         min_ratio = max(0.85, min(self.min_price_ratio, 1.25))
         max_ratio = min(1.25, max(self.max_price_ratio, 0.85))
         if min_ratio > max_ratio:
@@ -263,6 +277,7 @@ class DynamicPricingEngine:
         max_price = base * max_ratio
         was_clamped = capped
 
+        optimal_price = base * surge_multiplier
         if capped:
             optimal_price = base
         elif optimal_price < min_price:
@@ -278,9 +293,11 @@ class DynamicPricingEngine:
             product_id=product_id,
             base_price=base,
             optimal_price=round(optimal_price, 2),
-            demand_factor=round(demand_adj, 4),
-            stock_factor=round(stock_adj, 4),
-            sentiment_factor=round(sentiment_adj, 4),
+            demand_factor=round(float(demand_factor), 4),
+            stock_factor=round(scarcity_multiplier - 1.0, 4),
+            sentiment_factor=round(
+                float(self.sentiment_beta) * clipped_sentiment, 4
+            ),
             change_pct=change_pct,
             capped=was_clamped,
             live_factor=round(live_adj, 4),
@@ -434,7 +451,7 @@ def create_recommendation_engine(top_n: int = 5) -> RecommendationEngine:
 
 
 def create_pricing_engine() -> DynamicPricingEngine:
-    """Factory function to create a dynamic pricing engine."""
+    """Factory returning the §2 engine (γ=0.15, β=0.20, S_ref=500 kg, band 0.85–1.25)."""
     return DynamicPricingEngine()
 
 

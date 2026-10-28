@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from app_pages.api_helpers import _api_get
+from app_pages.api_helpers import _api_get, _api_upload
 from app_pages.ui import page_header
 
 
@@ -30,6 +30,123 @@ def _price_history(product: Dict[str, Any]) -> List[Dict[str, Any]]:
             ),
         },
     ]
+
+
+def _comparison_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build comparable Day 1 and Day 2 APMC prices for each commodity."""
+    return [
+        {
+            "Commodity": str(product.get("name") or "Unknown"),
+            "Day 1 (₹/kg)": float(product.get("day1_price") or 0.0),
+            "Day 2 (₹/kg)": float(product.get("day2_price") or 0.0),
+        }
+        for product in products
+    ]
+
+
+def _render_report_uploads() -> None:
+    """Upload market reports and explore their Redis-backed price history."""
+    with st.container(border=True):
+        st.subheader("Import a market report")
+        st.caption(
+            "Upload an Agmarknet Marketwise Price & Arrival PDF or a CSV with "
+            "commodity, market date, and price, MSP, or arrival columns."
+        )
+        uploaded_file = st.file_uploader(
+            "Market report",
+            type=["pdf", "csv"],
+            key="market_report_upload",
+        )
+        if st.button(
+            "Import report",
+            key="import_market_report",
+            disabled=uploaded_file is None,
+        ):
+            result = _api_upload(
+                "/api/market-prices/upload",
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+            )
+            if result and result.get("ok"):
+                details = result.get("data") or {}
+                st.success(
+                    f"Imported {details.get('rows_parsed', 0)} rows "
+                    f"({details.get('inserted', 0)} new, "
+                    f"{details.get('updated', 0)} updated)."
+                )
+            else:
+                st.error(
+                    (result or {}).get("error")
+                    or "Report upload failed; check the Flask API connection."
+                )
+
+    response = _api_get("/api/market-prices", params={"limit": 1000}, ttl=0)
+    if response is None:
+        st.error("Could not load market history. Check the Flask API and Redis connection.")
+        return
+    records = response.get("data") or []
+    if not records:
+        st.info("No market reports have been imported yet.")
+        return
+
+    commodities = sorted({str(row.get("commodity") or "Unknown") for row in records})
+    selected_commodity = st.selectbox(
+        "Commodity",
+        commodities,
+        key="market_history_commodity",
+    )
+    filtered = [
+        row for row in records
+        if str(row.get("commodity") or "Unknown") == selected_commodity
+    ]
+    markets = sorted({str(row.get("market") or "Unknown") for row in filtered})
+    selected_market = st.selectbox(
+        "Market",
+        ["All markets", *markets],
+        key="market_history_market",
+    )
+    if selected_market != "All markets":
+        filtered = [
+            row for row in filtered
+            if str(row.get("market") or "Unknown") == selected_market
+        ]
+
+    history = pd.DataFrame(
+        [
+            {
+                "Date": row.get("market_date"),
+                "Price (₹/kg)": row.get("price_per_kg"),
+                "MSP (₹/kg)": row.get("msp_per_kg"),
+                "Arrival (MT)": row.get("arrival_metric_tonnes"),
+                "Market": row.get("market"),
+                "Source": row.get("source"),
+            }
+            for row in filtered
+        ]
+    )
+    for column in ("Price (₹/kg)", "MSP (₹/kg)", "Arrival (MT)"):
+        history[column] = pd.to_numeric(history[column], errors="coerce")
+
+    price_columns = [
+        column for column in ("Price (₹/kg)", "MSP (₹/kg)")
+        if history[column].notna().any()
+    ]
+    if price_columns:
+        st.subheader(f"{selected_commodity} price and MSP history")
+        st.line_chart(
+            history,
+            x="Date",
+            y=price_columns,
+            color=["#287D58", "#D89B28"][:len(price_columns)],
+        )
+    if history["Arrival (MT)"].notna().any():
+        st.subheader("Reported arrivals")
+        st.bar_chart(history, x="Date", y="Arrival (MT)", color="#287D58")
+
+    st.dataframe(history, hide_index=True, width="stretch")
+    st.caption(
+        "MSP and arrival values remain blank when the source report does not provide them."
+    )
 
 
 @st.fragment(run_every=3)
@@ -74,6 +191,30 @@ def _render_public() -> None:
             ),
             key="market_signal_product",
         )
+
+    comparison = _comparison_rows(filtered_products)
+    if comparison:
+        st.subheader("Day 2 price comparison")
+        st.caption(
+            "Compare each commodity’s Day 2 APMC price with its Day 1 reference (₹/kg)."
+        )
+        st.bar_chart(
+            pd.DataFrame(comparison),
+            x="Commodity",
+            y=["Day 1 (₹/kg)", "Day 2 (₹/kg)"],
+            horizontal=True,
+            sort="-Day 2 (₹/kg)",
+            stack=False,
+            height=max(420, min(780, len(comparison) * 22)),
+        )
+        if all(
+            row["Day 1 (₹/kg)"] == row["Day 2 (₹/kg)"]
+            for row in comparison
+        ):
+            st.info(
+                "The current market feed has identical Day 1 and Day 2 prices "
+                "for these commodities, so no day-over-day movement is available."
+            )
 
     product = next(
         item for item in filtered_products if str(item["id"]) == selected_id
@@ -133,20 +274,18 @@ def _render_public() -> None:
                 color="orange" if product.get("capped") else "green",
             )
 
-    with st.expander("Compare all commodities"):
+    with st.expander("View exact comparison values"):
         st.dataframe(
             [
                 {
-                    "Commodity": item.get("name", "Unknown"),
-                    "Category": item.get("category", "Other"),
-                    "Day 1 (₹/kg)": float(item.get("day1_price") or 0.0),
-                    "Day 2 (₹/kg)": float(item.get("day2_price") or 0.0),
+                    **row,
+                    "Category": str(product.get("category") or "Other"),
                     "Live (₹/kg)": float(
-                        item.get("dynamic_price") or item.get("day2_price") or 0.0
+                        product.get("dynamic_price") or product.get("day2_price") or 0.0
                     ),
-                    "Movement": f"{float(item.get('price_change_pct') or 0.0):+.1f}%",
+                    "Movement": f"{float(product.get('price_change_pct') or 0.0):+.1f}%",
                 }
-                for item in filtered_products
+                for row, product in zip(comparison, filtered_products)
             ],
             hide_index=True,
             width="stretch",
@@ -168,11 +307,7 @@ def app() -> None:
         label_visibility="collapsed",
     )
     if section == "Report uploads":
-        st.info(
-            "Market report uploads and MSP/arrival history are not available in "
-            "the current Phase 2 REST backend. The live commodity price explorer "
-            "uses the supported Redis-backed feed."
-        )
+        _render_report_uploads()
         return
 
     _render_public()
