@@ -103,6 +103,8 @@ logs/
 *.tmp
 *.bak
 *.pid
+report.md
+extract.md
 
 # Downloaded market reports kept outside the tracked sample fixture
 /Market_Wise_Price_Arrival_*.pdf
